@@ -42,8 +42,12 @@ class ClaudeCliAuthTests(unittest.TestCase):
 
     def test_credential_resolver_shape_matches_copilot(self):
         """Resolver returns the same dict keys copilot-acp returns."""
-        with patch("hermes_cli.auth.shutil.which", side_effect=lambda c: c):
-            creds = auth.resolve_external_process_provider_credentials("claude-cli")
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("HERMES_CLAUDE_CLI_COMMAND", None)
+            os.environ.pop("CLAUDE_CLI_PATH", None)
+            os.environ.pop("HERMES_CLAUDE_CLI_ARGS", None)
+            with patch("hermes_cli.auth.shutil.which", return_value="/usr/bin/claude"):
+                creds = auth.resolve_external_process_provider_credentials("claude-cli")
         self.assertEqual(
             set(creds.keys()),
             {"provider", "api_key", "base_url", "command", "args", "source"},
@@ -52,6 +56,24 @@ class ClaudeCliAuthTests(unittest.TestCase):
         self.assertEqual(creds["api_key"], "claude-cli")
         self.assertEqual(creds["args"], [])
         self.assertEqual(creds["source"], "process")
+
+    def test_credential_resolver_missing_cli_raises(self):
+        """With no env override and `claude` unresolvable, the resolver raises
+        an AuthError tagged ``missing_claude_cli`` (never silently returns)."""
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("HERMES_CLAUDE_CLI_COMMAND", None)
+            os.environ.pop("CLAUDE_CLI_PATH", None)
+            with patch("hermes_cli.auth.shutil.which", return_value=None):
+                with self.assertRaises(auth.AuthError) as ctx:
+                    auth.resolve_external_process_provider_credentials("claude-cli")
+        self.assertEqual(ctx.exception.code, "missing_claude_cli")
+
+    def test_credential_resolver_parses_args_env(self):
+        """HERMES_CLAUDE_CLI_ARGS is shlex-split into the returned args list."""
+        with patch.dict(os.environ, {"HERMES_CLAUDE_CLI_ARGS": "--foo bar"}, clear=False):
+            with patch("hermes_cli.auth.shutil.which", return_value="/usr/bin/claude"):
+                creds = auth.resolve_external_process_provider_credentials("claude-cli")
+            self.assertEqual(creds.get("args"), ["--foo", "bar"])
 
     def test_status_routes_through_external_process(self):
         status = auth.get_auth_status("claude-cli")

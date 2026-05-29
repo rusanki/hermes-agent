@@ -6323,7 +6323,7 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
             "provider": provider_id,
             "api_key": "claude-cli",
             "base_url": base_url.rstrip("/"),
-            "command": resolved_command or command,
+            "command": resolved_command,
             "args": args,
             "source": "process",
         }
