@@ -8,6 +8,10 @@ from agent.claude_cli_client import (
     _split_system_message,
     _render_assistant_tool_calls,
     _render_tool_response,
+    _parse_stream_json_lines,
+    ClaudeCliQuotaError,
+    ClaudeCliAuthError,
+    ClaudeCliError,
 )
 
 
@@ -120,6 +124,59 @@ class FormatterTests(unittest.TestCase):
         block = _render_tool_response(msgs[0])
         inner = json.loads(block.split("<tool_response>\n", 1)[1].rsplit("\n</tool_response>", 1)[0])
         self.assertEqual(inner["content"], {"result": "ok"})
+
+
+class StreamParserTests(unittest.TestCase):
+    def _lines(self, *objs):
+        return [json.dumps(o) for o in objs]
+
+    def test_parses_assistant_text_and_result(self):
+        lines = self._lines(
+            {"type": "system", "subtype": "init"},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "hello "}], "usage": {"input_tokens": 10, "output_tokens": 2}}},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "world"}], "usage": {"input_tokens": 10, "output_tokens": 4}}},
+            {"type": "result", "subtype": "success", "is_error": False, "api_error_status": None, "stop_reason": "end_turn", "result": "hello world", "usage": {"input_tokens": 10, "output_tokens": 4, "cache_read_input_tokens": 3}, "total_cost_usd": 0.01},
+        )
+        parsed = _parse_stream_json_lines(lines)
+        self.assertEqual(parsed.text, "hello world")
+        self.assertEqual(parsed.stop_reason, "end_turn")
+        self.assertEqual(parsed.usage["output_tokens"], 4)
+        self.assertEqual(parsed.usage["cache_read_input_tokens"], 3)
+        self.assertAlmostEqual(parsed.cost_usd, 0.01)
+
+    def test_quota_error_raises(self):
+        lines = self._lines(
+            {"type": "result", "subtype": "error", "is_error": True, "api_error_status": 400, "result": "You're out of extra usage. Add more at claude.ai/settings/usage and keep going."},
+        )
+        with self.assertRaises(ClaudeCliQuotaError):
+            _parse_stream_json_lines(lines)
+
+    def test_auth_error_raises(self):
+        lines = self._lines(
+            {"type": "result", "subtype": "error", "is_error": True, "api_error_status": 401, "result": "Unauthorized: please authenticate."},
+        )
+        with self.assertRaises(ClaudeCliAuthError):
+            _parse_stream_json_lines(lines)
+
+    def test_generic_error_raises_base(self):
+        lines = self._lines(
+            {"type": "result", "subtype": "error", "is_error": True, "api_error_status": 500, "result": "internal server error"},
+        )
+        with self.assertRaises(ClaudeCliError):
+            _parse_stream_json_lines(lines)
+
+    def test_malformed_line_is_skipped(self):
+        lines = ["not json", json.dumps({"type": "result", "subtype": "success", "is_error": False, "api_error_status": None, "stop_reason": "end_turn", "result": "ok", "usage": {}, "total_cost_usd": 0.0})]
+        parsed = _parse_stream_json_lines(lines)
+        self.assertEqual(parsed.text, "ok")
+
+    def test_assistant_buffer_used_when_no_result_text(self):
+        lines = self._lines(
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "partial"}], "usage": {}}},
+        )
+        parsed = _parse_stream_json_lines(lines)
+        self.assertEqual(parsed.text, "partial")
+        self.assertIsNone(parsed.stop_reason)
 
 
 if __name__ == "__main__":

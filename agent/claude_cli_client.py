@@ -30,9 +30,12 @@ The subprocess client class itself is added in a later task.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from types import SimpleNamespace
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 _TOOL_CALL_JSON_RE = re.compile(r"\{\s*\"id\"\s*:\s*\"[^\"]+\"\s*,\s*\"type\"\s*:\s*\"function\"\s*,\s*\"function\"\s*:\s*\{.*?\}\s*\}", re.DOTALL)
@@ -305,3 +308,120 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[SimpleNamespace], str
 
     cleaned = "\n".join(p.strip() for p in parts if p and p.strip()).strip()
     return extracted, cleaned
+
+
+class ClaudeCliError(RuntimeError):
+    """Base error for failures surfaced by the ``claude`` CLI ``result`` event."""
+
+
+class ClaudeCliQuotaError(ClaudeCliError):
+    """The CLI reported a usage/quota exhaustion error."""
+
+
+class ClaudeCliAuthError(ClaudeCliError):
+    """The CLI reported an authentication/authorization error."""
+
+
+# Substrings (matched case-insensitively) that classify a CLI error message.
+_QUOTA_MARKERS = ("out of extra usage", "extra usage", "/settings/usage")
+_AUTH_MARKERS = ("unauthorized", "authenticate", "401", "invalid api key", "login")
+
+
+def _classify_cli_error(message: str) -> ClaudeCliError:
+    """Map an error ``result`` message to the most specific error class.
+
+    Quota wording wins over auth wording; anything unmatched is the base
+    :class:`ClaudeCliError`.
+    """
+
+    lowered = (message or "").lower()
+    if any(marker in lowered for marker in _QUOTA_MARKERS):
+        return ClaudeCliQuotaError(message)
+    if any(marker in lowered for marker in _AUTH_MARKERS):
+        return ClaudeCliAuthError(message)
+    return ClaudeCliError(message)
+
+
+def _parse_stream_json_lines(lines: Any) -> SimpleNamespace:
+    """Parse the line-delimited JSON event stream from ``claude -p``.
+
+    ``claude -p --output-format stream-json --verbose`` emits one JSON object
+    per stdout line. This consumes ``lines`` (an iterable of strings) and folds
+    them into a :class:`types.SimpleNamespace` with attributes ``text`` (str),
+    ``stop_reason`` (str | None), ``usage`` (dict), ``cost_usd`` (float) and
+    ``raw_result`` (the terminal ``result`` event dict, or ``None``).
+
+    Malformed lines are skipped (never crash). ``assistant`` events accumulate
+    text and refresh the latest usage. A ``result`` event is terminal: on error
+    it raises a classified :class:`ClaudeCliError`; on success it supplies the
+    authoritative final text/usage/cost. If the stream ends without a ``result``
+    event (e.g. truncated output), the accumulated state is returned as-is
+    rather than raising.
+    """
+
+    buffer: list[str] = []
+    last_usage: dict[str, Any] = {}
+
+    for line in lines:
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+
+        event_type = obj.get("type")
+
+        if event_type == "assistant":
+            message = obj.get("message")
+            if isinstance(message, dict):
+                content = message.get("content")
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            text = item.get("text")
+                            if isinstance(text, str):
+                                buffer.append(text)
+                usage = message.get("usage")
+                if isinstance(usage, dict):
+                    last_usage = usage
+            continue
+
+        if event_type == "result":
+            if obj.get("is_error") or obj.get("api_error_status"):
+                message_text = obj.get("result")
+                if not isinstance(message_text, str) or not message_text:
+                    message_text = "claude CLI reported an error"
+                raise _classify_cli_error(message_text)
+
+            usage = obj.get("usage")
+            if not isinstance(usage, dict):
+                usage = {}
+            try:
+                cost_usd = float(obj.get("total_cost_usd") or 0.0)
+            except (TypeError, ValueError):
+                cost_usd = 0.0
+            result_text = obj.get("result")
+            text = result_text if isinstance(result_text, str) and result_text else "".join(buffer)
+            return SimpleNamespace(
+                text=text,
+                stop_reason=obj.get("stop_reason"),
+                usage=usage,
+                cost_usd=cost_usd,
+                raw_result=obj,
+            )
+
+        if event_type == "rate_limit_event":
+            logger.debug("claude-cli rate_limit_event: %s", obj)
+            continue
+
+        # Unknown / "system" events are ignored.
+
+    # No terminal result event seen — return what we accumulated.
+    return SimpleNamespace(
+        text="".join(buffer),
+        stop_reason=None,
+        usage=last_usage or {},
+        cost_usd=0.0,
+        raw_result=None,
+    )
