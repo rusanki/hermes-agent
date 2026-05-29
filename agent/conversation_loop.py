@@ -1124,6 +1124,11 @@ def run_conversation(
                 # try to iterate a non-iterable response and break, so force the
                 # non-streaming path.  Same predicate as the Responses-API
                 # auto-upgrade exclusion in agent_init (source of truth).
+                # NOTE: _is_external_process_runtime also gates the Responses-API
+                # auto-upgrade exclusion in agent_init.  These coincide today
+                # (external-process clients are blocking + non-streamable).  If a
+                # future external-process provider supports streaming, split this
+                # predicate from that exclusion.
                 elif _is_external_process_runtime(agent.provider, agent.base_url):
                     _use_streaming = False
                 elif not agent._has_stream_consumers():
