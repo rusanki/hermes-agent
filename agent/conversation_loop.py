@@ -27,6 +27,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
+from agent.agent_init import _is_external_process_runtime
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
@@ -1117,15 +1118,13 @@ def run_conversation(
                 # session instead of re-failing every retry.
                 if getattr(agent, "_disable_streaming", False):
                     _use_streaming = False
-                # CopilotACPClient communicates via subprocess stdio and
-                # returns a plain SimpleNamespace — not an iterable
-                # stream.  Mirror the ACP exclusion used for Responses
-                # API upgrade (lines ~1083-1085).
-                elif (
-                    agent.provider == "copilot-acp"
-                    or str(agent.base_url or "").lower().startswith("acp://copilot")
-                    or str(agent.base_url or "").lower().startswith("acp+tcp://")
-                ):
+                # External-process runtimes (CopilotACPClient, ClaudeCliClient)
+                # communicate via subprocess stdio and return a plain blocking
+                # SimpleNamespace — NOT an iterable stream.  Streaming them would
+                # try to iterate a non-iterable response and break, so force the
+                # non-streaming path.  Same predicate as the Responses-API
+                # auto-upgrade exclusion in agent_init (source of truth).
+                elif _is_external_process_runtime(agent.provider, agent.base_url):
                     _use_streaming = False
                 elif not agent._has_stream_consumers():
                     # No display/TTS consumer. Still prefer streaming for
