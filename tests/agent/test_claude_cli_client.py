@@ -1,8 +1,12 @@
 """Unit tests for the claude-cli provider client (no real subprocess)."""
 from __future__ import annotations
 import json
+import os as _os
 import unittest
+from unittest.mock import patch
 from agent.claude_cli_client import (
+    ClaudeCliClient,
+    _build_subprocess_env,
     _format_messages_as_prompt,
     _extract_tool_calls_from_text,
     _split_system_message,
@@ -235,6 +239,59 @@ class StreamParserTests(unittest.TestCase):
         with self.assertRaises(ClaudeCliError) as cm:
             _parse_stream_json_lines(lines)
         self.assertNotIsInstance(cm.exception, ClaudeCliAuthError)
+
+
+class ClientFacadeTests(unittest.TestCase):
+    def _client_with_output(self, lines):
+        client = ClaudeCliClient(model="claude-opus-4-8")
+        client._run_claude = lambda prompt, system_prompt, model, timeout: list(lines)
+        return client
+
+    def test_text_response_shape(self):
+        lines = [json.dumps({"type": "result", "subtype": "success", "is_error": False, "api_error_status": None,
+                             "stop_reason": "end_turn", "result": "hi there", "usage": {"input_tokens": 5, "output_tokens": 2}, "total_cost_usd": 0.001})]
+        client = self._client_with_output(lines)
+        resp = client.chat.completions.create(model="claude-opus-4-8",
+            messages=[{"role": "system", "content": "S"}, {"role": "user", "content": "hi"}])
+        self.assertEqual(resp.choices[0].message.content, "hi there")
+        self.assertEqual(resp.choices[0].finish_reason, "stop")
+        self.assertFalse(resp.choices[0].message.tool_calls)
+        self.assertEqual(resp.usage.prompt_tokens, 5)
+        self.assertEqual(resp.usage.completion_tokens, 2)
+
+    def test_tool_call_response_shape(self):
+        result_text = '<tool_call>{"name": "read_file", "arguments": "{\\"path\\": \\"/x\\"}"}</tool_call>'
+        lines = [json.dumps({"type": "result", "subtype": "success", "is_error": False, "api_error_status": None,
+                             "stop_reason": "end_turn", "result": result_text, "usage": {}, "total_cost_usd": 0.0})]
+        client = self._client_with_output(lines)
+        resp = client.chat.completions.create(model="claude-opus-4-8", messages=[{"role": "user", "content": "read /x"}])
+        self.assertEqual(resp.choices[0].finish_reason, "tool_calls")
+        self.assertEqual(resp.choices[0].message.tool_calls[0].function.name, "read_file")
+
+    def test_quota_error_propagates(self):
+        from agent.claude_cli_client import ClaudeCliQuotaError
+        lines = [json.dumps({"type": "result", "is_error": True, "api_error_status": 400,
+                             "result": "You're out of extra usage. Add more at claude.ai/settings/usage and keep going."})]
+        client = self._client_with_output(lines)
+        with self.assertRaises(ClaudeCliQuotaError):
+            client.chat.completions.create(model="claude-opus-4-8", messages=[{"role": "user", "content": "hi"}])
+
+    def test_accepts_unknown_kwargs(self):
+        client = ClaudeCliClient(model="claude-opus-4-8", max_retries=0, default_headers={}, api_key=None, base_url=None)
+        self.assertIsNotNone(client)
+
+    def test_model_normalization(self):
+        from agent.claude_cli_client import _normalize_model
+        self.assertEqual(_normalize_model("anthropic/claude-opus-4-8"), "claude-opus-4-8")
+        self.assertEqual(_normalize_model("claude-cli/claude-opus-4-8"), "claude-opus-4-8")
+        self.assertEqual(_normalize_model("claude-opus-4-8"), "claude-opus-4-8")
+        self.assertEqual(_normalize_model(None), "claude-opus-4-8")
+
+    def test_subprocess_env_scrubs_anthropic_api_key(self):
+        with patch.dict(_os.environ, {"ANTHROPIC_API_KEY": "sk-ant-api-should-be-removed"}, clear=False):
+            env = _build_subprocess_env()
+            self.assertNotIn("ANTHROPIC_API_KEY", env)
+            self.assertIn("HOME", env)
 
 
 if __name__ == "__main__":

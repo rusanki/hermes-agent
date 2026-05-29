@@ -31,11 +31,18 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import subprocess
+import threading
 from types import SimpleNamespace
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+CLAUDE_CLI_MARKER_BASE_URL = "claude-cli://local"
+_DEFAULT_TIMEOUT_SECONDS = 900.0
+_DEFAULT_MODEL = "claude-opus-4-8"
 
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 _TOOL_CALL_JSON_RE = re.compile(r"\{\s*\"id\"\s*:\s*\"[^\"]+\"\s*,\s*\"type\"\s*:\s*\"function\"\s*,\s*\"function\"\s*:\s*\{.*?\}\s*\}", re.DOTALL)
@@ -441,3 +448,292 @@ def _parse_stream_json_lines(lines: Any) -> SimpleNamespace:
         cost_usd=0.0,
         raw_result=None,
     )
+
+
+def _resolve_home_dir() -> str:
+    """Return a stable HOME for child ``claude`` CLI processes."""
+
+    try:
+        from hermes_constants import get_subprocess_home
+
+        profile_home = get_subprocess_home()
+        if profile_home:
+            return profile_home
+    except Exception:
+        pass
+
+    home = os.environ.get("HOME", "").strip()
+    if home:
+        return home
+
+    expanded = os.path.expanduser("~")
+    if expanded and expanded != "~":
+        return expanded
+
+    try:
+        import pwd
+
+        resolved = pwd.getpwuid(os.getuid()).pw_dir.strip()  # windows-footgun: ok — POSIX fallback inside try/except (pwd import fails on Windows)
+        if resolved:
+            return resolved
+    except Exception:
+        pass
+
+    # Last resort: /tmp (writable on any POSIX system). Avoids crashing the
+    # subprocess with no HOME; callers can set HERMES_HOME explicitly if they
+    # need a different writable dir.
+    return "/tmp"
+
+
+def _build_subprocess_env() -> dict[str, str]:
+    """Build the environment for the child ``claude`` CLI process.
+
+    SECURITY: ``ANTHROPIC_API_KEY`` is scrubbed so the CLI can NEVER fall back
+    to an API-key billing path. The provider exists to drive subscription OAuth
+    (Claude Code print mode); leaving the key in the environment would silently
+    route inference through metered API billing. This scrub is the core billing
+    safeguard for the provider — do not remove it.
+    """
+
+    env = os.environ.copy()
+    env["HOME"] = _resolve_home_dir()
+    env.pop("ANTHROPIC_API_KEY", None)
+    return env
+
+
+def _resolve_command() -> str:
+    return (
+        os.getenv("HERMES_CLAUDE_CLI_COMMAND", "").strip()
+        or os.getenv("CLAUDE_CLI_PATH", "").strip()
+        or "claude"
+    )
+
+
+def _normalize_model(m: str | None) -> str:
+    """Strip a provider prefix from a model id, defaulting when empty.
+
+    Accepts ``claude-cli/<id>`` and ``anthropic/<id>`` forms (the prefixes
+    Hermes may attach when routing to this provider) and returns the bare CLI
+    model id. ``None``/empty falls back to :data:`_DEFAULT_MODEL`.
+    """
+
+    if not m or not str(m).strip():
+        return _DEFAULT_MODEL
+    name = str(m).strip()
+    for prefix in ("claude-cli/", "anthropic/"):
+        if name.startswith(prefix):
+            name = name[len(prefix):].strip()
+            break
+    return name or _DEFAULT_MODEL
+
+
+TOOL_MARKUP_INSTRUCTION = (
+    "You are being used as a pure inference engine. You have NO tools of your "
+    "own and cannot run commands, read files, or take actions directly.\n"
+    "When an action IS needed, you MUST request it by emitting a tool call as a "
+    "single line of markup and nothing else for that call:\n"
+    '<tool_call>{"name": "<tool_name>", "arguments": "<json-string-of-args>"}</tool_call>\n'
+    "Rules:\n"
+    "- Emit exactly one JSON object per <tool_call> block; \"arguments\" must be "
+    "a JSON string (a string whose contents are themselves valid JSON).\n"
+    "- Emit one <tool_call> block per tool call; do not wrap multiple calls in "
+    "one block.\n"
+    "- Do NOT apologize for lacking tools and do NOT claim you cannot perform an "
+    "action — instead emit the appropriate <tool_call> and let Hermes execute "
+    "it.\n"
+    "- If no tool is needed, just answer the user normally with plain text."
+)
+
+
+class _ChatCompletions:
+    def __init__(self, client: "ClaudeCliClient"):
+        self._client = client
+
+    def create(self, **kwargs: Any) -> Any:
+        return self._client._create_chat_completion(**kwargs)
+
+
+class _ChatNamespace:
+    def __init__(self, client: "ClaudeCliClient"):
+        self.completions = _ChatCompletions(client)
+
+
+class ClaudeCliClient:
+    """Minimal OpenAI-client-compatible facade driving the ``claude`` CLI.
+
+    Each ``chat.completions.create`` call renders the conversation into a single
+    prompt, spawns ``claude -p --output-format stream-json`` as a short-lived
+    subprocess, parses the line-delimited JSON it streams back, and converts the
+    result into the minimal shape Hermes expects from an OpenAI client. Hermes
+    owns the tool-execution loop; the CLI is a pure inference engine.
+    """
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        default_headers: dict[str, str] | None = None,
+        command: str | None = None,
+        args: list[str] | None = None,
+        model: str | None = None,
+        **_: Any,
+    ):
+        self.api_key = api_key or "claude-cli"
+        self.base_url = base_url or CLAUDE_CLI_MARKER_BASE_URL
+        self._default_headers = dict(default_headers or {})
+        self._command = command or _resolve_command()
+        self._args = list(args) if args else []
+        self._default_model = model
+        self.chat = _ChatNamespace(self)
+        self.is_closed = False
+        self._active_process: subprocess.Popen[str] | None = None
+        self._active_process_lock = threading.Lock()
+
+    def _build_system_prompt(self, system_text: str) -> str:
+        if system_text and system_text.strip():
+            return system_text + "\n\n" + TOOL_MARKUP_INSTRUCTION
+        return TOOL_MARKUP_INSTRUCTION
+
+    def close(self) -> None:
+        proc: subprocess.Popen[str] | None
+        with self._active_process_lock:
+            proc = self._active_process
+            self._active_process = None
+        self.is_closed = True
+        if proc is None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def _create_chat_completion(
+        self,
+        *,
+        model: str | None = None,
+        messages: list[dict[str, Any]] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any = None,
+        timeout: float | None = None,
+        **_: Any,
+    ) -> Any:
+        system_text, rest = _split_system_message(messages or [])
+        prompt = _format_messages_as_prompt(rest, model, tools, tool_choice)
+        sys_prompt = self._build_system_prompt(system_text)
+        eff_model = _normalize_model(model or self._default_model)
+
+        lines = self._run_claude(prompt, sys_prompt, eff_model, timeout)
+        parsed = _parse_stream_json_lines(lines)
+        tool_calls, cleaned = _extract_tool_calls_from_text(parsed.text)
+
+        prompt_tokens = parsed.usage.get("input_tokens", 0)
+        completion_tokens = parsed.usage.get("output_tokens", 0)
+        usage = SimpleNamespace(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+            prompt_tokens_details=SimpleNamespace(
+                cached_tokens=parsed.usage.get("cache_read_input_tokens", 0)
+            ),
+        )
+        assistant_message = SimpleNamespace(
+            content=cleaned,
+            tool_calls=tool_calls,
+            reasoning=None,
+            reasoning_content=None,
+            reasoning_details=None,
+        )
+        finish_reason = "tool_calls" if tool_calls else "stop"
+        choice = SimpleNamespace(message=assistant_message, finish_reason=finish_reason)
+        return SimpleNamespace(choices=[choice], usage=usage, model=eff_model)
+
+    def _run_claude(
+        self,
+        prompt: str,
+        system_prompt: str,
+        model: str,
+        timeout: float | None,
+    ) -> list[str]:
+        # Normalise timeout: run_agent.py may pass an httpx.Timeout object
+        # (used natively by the OpenAI SDK) rather than a plain float.
+        if timeout is None:
+            effective_timeout = _DEFAULT_TIMEOUT_SECONDS
+        elif isinstance(timeout, (int, float)):
+            effective_timeout = float(timeout)
+        else:
+            # httpx.Timeout or similar — pick the largest component so the
+            # subprocess has enough wall-clock time for the full response.
+            candidates = [
+                getattr(timeout, attr, None)
+                for attr in ("read", "write", "connect", "pool", "timeout")
+            ]
+            numeric = [float(v) for v in candidates if isinstance(v, (int, float))]
+            effective_timeout = max(numeric) if numeric else _DEFAULT_TIMEOUT_SECONDS
+
+        cmd = [
+            self._command,
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--input-format",
+            "text",
+            "--tools",
+            "",
+            "--setting-sources",
+            "",
+            "--strict-mcp-config",
+            "--model",
+            model,
+            "--system-prompt",
+            system_prompt,
+        ] + self._args
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=_build_subprocess_env(),
+            )
+        except FileNotFoundError as exc:
+            raise ClaudeCliAuthError(
+                "claude CLI not found; install it or set "
+                "HERMES_CLAUDE_CLI_COMMAND/CLAUDE_CLI_PATH"
+            ) from exc
+
+        self.is_closed = False
+        with self._active_process_lock:
+            self._active_process = proc
+
+        try:
+            try:
+                stdout, stderr = proc.communicate(
+                    input=prompt, timeout=effective_timeout
+                )
+            except subprocess.TimeoutExpired as exc:
+                proc.kill()
+                proc.communicate()
+                raise ClaudeCliError(
+                    f"claude CLI timed out after {effective_timeout}s"
+                ) from exc
+
+            stdout = stdout or ""
+            if proc.returncode != 0 and not stdout.strip():
+                stderr_snippet = (stderr or "").strip()[:2000]
+                raise ClaudeCliError(
+                    f"claude CLI exited with code {proc.returncode}"
+                    + (f": {stderr_snippet}" if stderr_snippet else "")
+                )
+            return stdout.splitlines()
+        finally:
+            with self._active_process_lock:
+                if self._active_process is proc:
+                    self._active_process = None
