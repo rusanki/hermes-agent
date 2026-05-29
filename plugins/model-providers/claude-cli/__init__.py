@@ -24,6 +24,9 @@ claude_cli = ClaudeCliProfile(
     env_vars=(),
     base_url="claude-cli://local",
     auth_type="external_process",
+    # UNPINNED alias — the `claude -p` subprocess resolves it itself.
+    # (anthropic/__init__.py pins its aux model; here the CLI does the lookup.)
+    default_aux_model="claude-haiku-4-5",
 )
 
 register_provider(claude_cli)

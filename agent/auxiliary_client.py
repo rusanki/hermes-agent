@@ -4162,7 +4162,9 @@ def resolve_provider_client(
             # inexpensive and so we never trip the empty-model (None,None) guard
             # for lack of a configured model.
             if not final_model:
-                final_model = _normalize_resolved_model("claude-haiku-4-5", provider)
+                final_model = _normalize_resolved_model(
+                    _get_aux_model_for_provider("claude-cli"), provider
+                )
             command = str(creds.get("command", "")).strip() or None
             args = list(creds.get("args") or [])
             api_key = str(creds.get("api_key", "")).strip() or None

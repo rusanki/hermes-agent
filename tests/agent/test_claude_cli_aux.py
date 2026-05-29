@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from agent import auxiliary_client
 from agent.claude_cli_client import ClaudeCliClient
+from hermes_cli.auth import AuthError
 
 
 class ClaudeCliAuxTests(unittest.TestCase):
@@ -60,6 +61,34 @@ class ClaudeCliAuxTests(unittest.TestCase):
         from agent.claude_cli_client import ClaudeCliClient
         self.assertIsInstance(client, ClaudeCliClient)  # NOT AsyncOpenAI
         self.assertTrue(model)
+
+    def test_requested_model_wins_over_default(self):
+        # An explicitly requested model must take precedence over the cheap aux
+        # DEFAULT (claude-haiku-4-5).  ``_read_main_model`` is forced empty so the
+        # only non-default source of a model is the requested ``model=`` argument.
+        with (
+            patch("hermes_cli.auth.shutil.which", return_value="/usr/bin/claude"),
+            patch("agent.auxiliary_client._read_main_model", return_value=""),
+        ):
+            client, model = auxiliary_client.resolve_provider_client(
+                "claude-cli", model="claude-opus-4-6"
+            )
+
+        self.assertIsInstance(client, ClaudeCliClient)
+        # Requested model wins — must NOT have been overridden by the haiku default.
+        self.assertIn("opus-4-6", model)
+        self.assertNotIn("haiku", model)
+
+    def test_missing_claude_binary_raises_auth_error(self):
+        # When the ``claude`` binary is not on PATH, external-process credential
+        # resolution must raise AuthError (degradation), not silently fall back
+        # to the HTTP Anthropic path.
+        with (
+            patch("hermes_cli.auth.shutil.which", return_value=None),
+            patch("agent.auxiliary_client._read_main_model", return_value=""),
+        ):
+            with self.assertRaises(AuthError):
+                auxiliary_client.resolve_provider_client("claude-cli")
 
     def test_claude_cli_not_aliased_to_anthropic(self):
         # Guard against the billing trap: claude-cli must NOT normalize to the
