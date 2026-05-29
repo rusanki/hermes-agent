@@ -323,8 +323,24 @@ class ClaudeCliAuthError(ClaudeCliError):
 
 
 # Substrings (matched case-insensitively) that classify a CLI error message.
+# NOTE: these markers are heuristic — they pattern-match free-text error
+# wording, so they are deliberately conservative to avoid false positives.
+# In particular the bare token "401" and the bare word "login" are NOT used,
+# because they match unrelated text ("processed 401k tokens", "weblogin
+# failed"); the 401 forms are matched via a delimited regex (so "401k" does
+# not trip it) and "login" is replaced with more specific phrasings.
 _QUOTA_MARKERS = ("out of extra usage", "extra usage", "/settings/usage")
-_AUTH_MARKERS = ("unauthorized", "authenticate", "401", "invalid api key", "login")
+_AUTH_MARKERS = (
+    "unauthorized",
+    "authenticate",
+    "invalid api key",
+    "log in",
+    "/login",
+    "please login",
+)
+# A 401 status that appears as a delimited token after a space / "status" /
+# "http" / "error" — but not as part of a larger word/number like "401k".
+_AUTH_401_RE = re.compile(r"(?:\bstatus|\bhttp|\berror|\s)\s*401(?!\w)", re.IGNORECASE)
 
 
 def _classify_cli_error(message: str) -> ClaudeCliError:
@@ -337,7 +353,7 @@ def _classify_cli_error(message: str) -> ClaudeCliError:
     lowered = (message or "").lower()
     if any(marker in lowered for marker in _QUOTA_MARKERS):
         return ClaudeCliQuotaError(message)
-    if any(marker in lowered for marker in _AUTH_MARKERS):
+    if any(marker in lowered for marker in _AUTH_MARKERS) or _AUTH_401_RE.search(lowered):
         return ClaudeCliAuthError(message)
     return ClaudeCliError(message)
 
@@ -365,7 +381,7 @@ def _parse_stream_json_lines(lines: Any) -> SimpleNamespace:
     for line in lines:
         try:
             obj = json.loads(line)
-        except Exception:
+        except (ValueError, TypeError):
             continue
         if not isinstance(obj, dict):
             continue

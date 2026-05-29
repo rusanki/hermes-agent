@@ -178,6 +178,64 @@ class StreamParserTests(unittest.TestCase):
         self.assertEqual(parsed.text, "partial")
         self.assertIsNone(parsed.stop_reason)
 
+    def test_empty_lines(self):
+        # No events at all: every field falls back to its empty default and
+        # nothing is raised.
+        parsed = _parse_stream_json_lines([])
+        self.assertEqual(parsed.text, "")
+        self.assertIsNone(parsed.stop_reason)
+        self.assertEqual(parsed.usage, {})
+        self.assertEqual(parsed.cost_usd, 0.0)
+        self.assertIsNone(parsed.raw_result)
+
+    def test_error_result_with_no_result_field(self):
+        # An error result lacking a "result" message must still raise, using the
+        # fallback message text.
+        lines = self._lines(
+            {"type": "result", "subtype": "error", "is_error": True, "api_error_status": 500},
+        )
+        with self.assertRaises(ClaudeCliError) as cm:
+            _parse_stream_json_lines(lines)
+        self.assertIn("error", str(cm.exception))
+
+    def test_non_dict_json_line_skipped(self):
+        # Bare JSON values (a number, a null) are valid JSON but not dict events;
+        # they must be skipped without crashing.
+        lines = [
+            "123",
+            "null",
+            json.dumps({"type": "result", "subtype": "success", "is_error": False, "api_error_status": None, "stop_reason": "end_turn", "result": "ok", "usage": {}, "total_cost_usd": 0.0}),
+        ]
+        parsed = _parse_stream_json_lines(lines)
+        self.assertEqual(parsed.text, "ok")
+
+    def test_multiple_text_parts_in_one_assistant(self):
+        # A single assistant event with multiple text parts and no result event:
+        # the parts are concatenated in order.
+        lines = self._lines(
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "A"}, {"type": "text", "text": "B"}], "usage": {}}},
+        )
+        parsed = _parse_stream_json_lines(lines)
+        self.assertEqual(parsed.text, "AB")
+
+    def test_quota_markers_beat_auth_markers(self):
+        # When an error message contains both quota and auth wording, quota wins.
+        lines = self._lines(
+            {"type": "result", "subtype": "error", "is_error": True, "api_error_status": 400, "result": "You're out of extra usage and also unauthorized."},
+        )
+        with self.assertRaises(ClaudeCliQuotaError):
+            _parse_stream_json_lines(lines)
+
+    def test_loose_401_not_misclassified(self):
+        # A bare "401" embedded in an unrelated word ("401k") must NOT be treated
+        # as an HTTP 401 / auth failure.
+        lines = self._lines(
+            {"type": "result", "subtype": "error", "is_error": True, "api_error_status": None, "result": "processed 401k tokens then failed"},
+        )
+        with self.assertRaises(ClaudeCliError) as cm:
+            _parse_stream_json_lines(lines)
+        self.assertNotIsInstance(cm.exception, ClaudeCliAuthError)
+
 
 if __name__ == "__main__":
     unittest.main()
