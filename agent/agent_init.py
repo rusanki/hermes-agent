@@ -163,6 +163,21 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
     agent.request_overrides = overrides
 
 
+_EXTERNAL_PROCESS_PROVIDERS = ("copilot-acp", "claude-cli")
+# URL prefixes that mark an external-process runtime (broader than the provider set)
+_EXTERNAL_PROCESS_URL_PREFIXES = ("acp://copilot", "acp+tcp://", "claude-cli://")
+
+
+def _is_external_process_runtime(provider, base_url) -> bool:
+    """True when the (provider, base_url) names an external-process subprocess runtime
+    (Copilot ACP or Claude CLI), which must NOT be auto-upgraded to the Responses API
+    and is dispatched to a dedicated subprocess client rather than the OpenAI SDK."""
+    url = str(base_url or "").lower()
+    if provider in _EXTERNAL_PROCESS_PROVIDERS:
+        return True
+    return any(url.startswith(p) for p in _EXTERNAL_PROCESS_URL_PREFIXES)
+
+
 def _inject_external_process_kwargs(agent, client_kwargs):
     """Inject resolved subprocess command/args into client_kwargs for external-process providers.
 
@@ -172,7 +187,7 @@ def _inject_external_process_kwargs(agent, client_kwargs):
     ``runtime["args"]``) regardless of provider, so the same attributes carry the
     resolved subprocess invocation for both providers.
     """
-    if agent.provider in ("copilot-acp", "claude-cli"):
+    if agent.provider in _EXTERNAL_PROCESS_PROVIDERS:
         client_kwargs["command"] = agent.acp_command
         client_kwargs["args"] = agent.acp_args
 
@@ -406,11 +421,7 @@ def init_agent(
     if (
         api_mode is None
         and agent.api_mode == "chat_completions"
-        and agent.provider != "copilot-acp"
-        and agent.provider != "claude-cli"
-        and not str(agent.base_url or "").lower().startswith("acp://copilot")
-        and not str(agent.base_url or "").lower().startswith("acp+tcp://")
-        and not str(agent.base_url or "").lower().startswith("claude-cli://")
+        and not _is_external_process_runtime(agent.provider, agent.base_url)
         and not agent._is_azure_openai_url()
         and (
             agent._is_direct_openai_url()

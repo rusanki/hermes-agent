@@ -24,30 +24,31 @@ class ClaudeCliInitTests(unittest.TestCase):
         self.assertNotIn("command", client_kwargs)
 
 
-class ClaudeCliResponsesGuardTests(unittest.TestCase):
-    """Guard the Responses-API auto-upgrade exclusion for claude-cli.
+class ExternalProcessRuntimeTests(unittest.TestCase):
+    """Guard the Responses-API auto-upgrade exclusion for external-process runtimes.
 
     The auto-upgrade guard in ``init_agent`` (~:368) excludes external-process
     runtimes from being silently switched from ``chat_completions`` to
-    ``codex_responses`` (ClaudeCliClient does not implement the Responses
-    surface). The exclusion is expressed as a provider check plus a
-    ``claude-cli://`` base_url prefix check, mirroring the copilot-acp /
-    ``acp://`` exclusions. These tests reproduce that exact predicate to lock
-    the behaviour in so the exclusion isn't dropped during a future refactor.
+    ``codex_responses`` (CopilotACPClient / ClaudeCliClient do not implement the
+    Responses surface). The exclusion is delegated to the pure
+    ``_is_external_process_runtime`` predicate; these tests assert that REAL
+    helper so the lock-in tracks the source of truth rather than a copy.
     """
 
-    @staticmethod
-    def _is_excluded_from_upgrade(provider, base_url):
-        """Mirror of the claude-cli portion of the init_agent guard predicate."""
-        return provider == "claude-cli" or str(base_url or "").lower().startswith(
-            "claude-cli://"
-        )
+    def test_claude_cli_provider_is_external_process(self):
+        self.assertTrue(agent_init._is_external_process_runtime("claude-cli", "claude-cli://local"))
 
-    def test_claude_cli_provider_excluded_from_responses_upgrade(self):
-        self.assertTrue(self._is_excluded_from_upgrade("claude-cli", ""))
+    def test_claude_cli_base_url_is_external_process(self):
+        self.assertTrue(agent_init._is_external_process_runtime("something", "claude-cli://local"))
 
-    def test_claude_cli_base_url_excluded_from_responses_upgrade(self):
-        self.assertTrue(self._is_excluded_from_upgrade("", "claude-cli://local"))
+    def test_copilot_is_external_process(self):
+        self.assertTrue(agent_init._is_external_process_runtime("copilot-acp", "acp://copilot"))
 
-    def test_regular_provider_not_excluded(self):
-        self.assertFalse(self._is_excluded_from_upgrade("openai", "https://api.openai.com"))
+    def test_acp_tcp_base_url_is_external_process(self):
+        self.assertTrue(agent_init._is_external_process_runtime("x", "acp+tcp://host:1234"))
+
+    def test_regular_provider_is_not_external_process(self):
+        self.assertFalse(agent_init._is_external_process_runtime("anthropic", "https://api.anthropic.com"))
+
+    def test_none_base_url_safe(self):
+        self.assertFalse(agent_init._is_external_process_runtime("anthropic", None))
