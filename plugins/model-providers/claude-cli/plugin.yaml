@@ -1,0 +1,5 @@
+name: claude-cli-profile
+kind: model-provider
+version: 1.0.0
+description: Drives the Claude CLI (claude -p) as a subprocess using Claude subscription OAuth
+author: upswing-one
