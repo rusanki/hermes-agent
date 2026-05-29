@@ -6,6 +6,8 @@ from agent.claude_cli_client import (
     _format_messages_as_prompt,
     _extract_tool_calls_from_text,
     _split_system_message,
+    _render_assistant_tool_calls,
+    _render_tool_response,
 )
 
 
@@ -55,6 +57,69 @@ class FormatterTests(unittest.TestCase):
         calls, cleaned = _extract_tool_calls_from_text("just text")
         self.assertEqual(calls, [])
         self.assertEqual(cleaned, "just text")
+
+    def test_render_extract_roundtrip(self):
+        # An assistant tool_call (args as a JSON string) rendered into a prompt
+        # and re-parsed must preserve the arguments. Extracted arguments is a
+        # JSON STRING, so json.loads() of it must equal the original object.
+        msgs = [{"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function",
+             "function": {"name": "read_file", "arguments": '{"path":"/x"}'}}]}]
+        prompt = _format_messages_as_prompt(msgs, model=None, tools=None)
+        calls, _ = _extract_tool_calls_from_text(prompt)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].function.name, "read_file")
+        self.assertEqual(json.loads(calls[0].function.arguments), {"path": "/x"})
+
+    def test_multiple_tool_calls_in_one_message(self):
+        msgs = [{"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function",
+             "function": {"name": "read_file", "arguments": '{"path":"/a"}'}},
+            {"id": "c2", "type": "function",
+             "function": {"name": "write_file", "arguments": '{"path":"/b"}'}}]}]
+        prompt = _format_messages_as_prompt(msgs, model=None, tools=None)
+        self.assertIn("read_file", prompt)
+        self.assertIn("write_file", prompt)
+        self.assertEqual(prompt.count("<tool_call>"), 2)
+        # The helper itself must emit exactly two blocks for two calls.
+        blocks = _render_assistant_tool_calls(msgs[0]["tool_calls"])
+        self.assertEqual(len(blocks), 2)
+
+    def test_assistant_with_both_content_and_tool_calls(self):
+        # Guards the divergence-from-ACP fix: an assistant turn carrying BOTH
+        # text content and tool calls must render both, not drop either.
+        msgs = [{"role": "assistant", "content": "thinking out loud",
+                 "tool_calls": [
+                     {"id": "c1", "type": "function",
+                      "function": {"name": "read_file", "arguments": '{"path":"/x"}'}}]}]
+        prompt = _format_messages_as_prompt(msgs, model=None, tools=None)
+        self.assertIn("thinking out loud", prompt)
+        self.assertIn("<tool_call>", prompt)
+        self.assertIn("read_file", prompt)
+
+    def test_malformed_tool_call_json_is_dropped_but_consumed(self):
+        # A malformed <tool_call> block yields zero calls, but the block is
+        # still stripped from the cleaned text while surrounding text survives.
+        text = "<tool_call>{not valid json}</tool_call> trailing"
+        calls, cleaned = _extract_tool_calls_from_text(text)
+        self.assertEqual(calls, [])
+        self.assertIn("trailing", cleaned)
+        self.assertNotIn("not valid json", cleaned)
+
+    def test_tool_message_with_json_string_content(self):
+        # A tool message whose content is a JSON string round-trips as a parsed
+        # structure inside the <tool_response> block.
+        msgs = [{"role": "tool", "tool_call_id": "c1", "name": "read_file",
+                 "content": '{"result": "ok"}'}]
+        prompt = _format_messages_as_prompt(msgs, model=None, tools=None)
+        self.assertIn("<tool_response>", prompt)
+        self.assertIn("result", prompt)
+        self.assertIn("ok", prompt)
+        # The helper itself must parse the JSON-string content into structure
+        # (not leave it escaped), so the inner payload round-trips.
+        block = _render_tool_response(msgs[0])
+        inner = json.loads(block.split("<tool_response>\n", 1)[1].rsplit("\n</tool_response>", 1)[0])
+        self.assertEqual(inner["content"], {"result": "ok"})
 
 
 if __name__ == "__main__":

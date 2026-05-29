@@ -17,6 +17,10 @@ Only the pure helpers live here:
   how-to-emit-tool-calls instruction prose (that lives in the system prompt in
   a later task); it keeps only the available-tool *schema*.
 * :func:`_render_message_content` normalises message content to a string.
+* :func:`_render_assistant_tool_calls` renders an assistant message's
+  ``tool_calls`` into ``<tool_call>`` blocks.
+* :func:`_render_tool_response` renders a ``role == "tool"`` message into a
+  ``<tool_response>`` block.
 * :func:`_extract_tool_calls_from_text` pulls OpenAI-shaped tool calls out of
   Claude's text output (XML blocks first, bare JSON as a fallback).
 
@@ -102,7 +106,7 @@ def _render_assistant_tool_calls(tool_calls: Any) -> list[str]:
         if isinstance(raw_args, str):
             try:
                 arguments: Any = json.loads(raw_args)
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 arguments = raw_args
         else:
             arguments = raw_args
