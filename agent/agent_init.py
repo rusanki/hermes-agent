@@ -163,6 +163,20 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
     agent.request_overrides = overrides
 
 
+def _inject_external_process_kwargs(agent, client_kwargs):
+    """Inject resolved subprocess command/args into client_kwargs for external-process providers.
+
+    External-process providers (copilot-acp, claude-cli) are backed by a local
+    CLI subprocess rather than an HTTP endpoint.  The runtime resolver populates
+    ``agent.acp_command`` / ``agent.acp_args`` (from ``runtime["command"]`` /
+    ``runtime["args"]``) regardless of provider, so the same attributes carry the
+    resolved subprocess invocation for both providers.
+    """
+    if agent.provider in ("copilot-acp", "claude-cli"):
+        client_kwargs["command"] = agent.acp_command
+        client_kwargs["args"] = agent.acp_args
+
+
 def init_agent(
     agent,
     base_url: str = None,
@@ -767,9 +781,7 @@ def init_agent(
                 client_kwargs = {"api_key": api_key, "base_url": base_url}
             if _provider_timeout is not None:
                 client_kwargs["timeout"] = _provider_timeout
-            if agent.provider == "copilot-acp":
-                client_kwargs["command"] = agent.acp_command
-                client_kwargs["args"] = agent.acp_args
+            _inject_external_process_kwargs(agent, client_kwargs)
             effective_base = base_url
             if base_url_host_matches(effective_base, "openrouter.ai"):
                 from agent.auxiliary_client import build_or_headers
