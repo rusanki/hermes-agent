@@ -3493,8 +3493,15 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
     except ImportError:
         pass
     try:
+        # Subprocess-backed clients (Copilot ACP, claude-cli) do NOT speak HTTP,
+        # so they must pass through untouched.  Re-wrapping them as AsyncOpenAI
+        # would point a real HTTP client at their non-routable subprocess marker
+        # base_url (e.g. claude-cli://local) and silently break async aux calls
+        # (compression, vision).  They already provide an async-capable
+        # ``.chat.completions.create`` themselves.
         from agent.copilot_acp_client import CopilotACPClient
-        if isinstance(sync_client, CopilotACPClient):
+        from agent.claude_cli_client import ClaudeCliClient
+        if isinstance(sync_client, (CopilotACPClient, ClaudeCliClient)):
             return sync_client, model
     except ImportError:
         pass

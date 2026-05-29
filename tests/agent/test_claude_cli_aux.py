@@ -50,6 +50,17 @@ class ClaudeCliAuxTests(unittest.TestCase):
         self.assertIsNotNone(client)
         self.assertTrue(model)
 
+    def test_aux_async_mode_preserves_claude_cli_client(self):
+        # In async_mode, the claude-cli aux client must stay a ClaudeCliClient (subprocess),
+        # NOT be re-wrapped into an AsyncOpenAI pointed at the claude-cli:// marker (which can't connect).
+        import unittest.mock as _mock
+        with _mock.patch("hermes_cli.auth.shutil.which", return_value="/usr/bin/claude"), \
+             _mock.patch("agent.auxiliary_client._read_main_model", return_value=""):
+            client, model = auxiliary_client.resolve_provider_client("claude-cli", async_mode=True)
+        from agent.claude_cli_client import ClaudeCliClient
+        self.assertIsInstance(client, ClaudeCliClient)  # NOT AsyncOpenAI
+        self.assertTrue(model)
+
     def test_claude_cli_not_aliased_to_anthropic(self):
         # Guard against the billing trap: claude-cli must NOT normalize to the
         # anthropic (HTTP) provider.
