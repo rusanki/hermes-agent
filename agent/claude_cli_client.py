@@ -488,16 +488,24 @@ def _resolve_home_dir() -> str:
 def _build_subprocess_env() -> dict[str, str]:
     """Build the environment for the child ``claude`` CLI process.
 
-    SECURITY: ``ANTHROPIC_API_KEY`` is scrubbed so the CLI can NEVER fall back
-    to an API-key billing path. The provider exists to drive subscription OAuth
-    (Claude Code print mode); leaving the key in the environment would silently
-    route inference through metered API billing. This scrub is the core billing
-    safeguard for the provider — do not remove it.
+    SECURITY: ``ANTHROPIC_API_KEY``, ``ANTHROPIC_AUTH_TOKEN`` and
+    ``ANTHROPIC_BASE_URL`` are all scrubbed so the CLI can NEVER fall back to a
+    metered billing path. The provider exists to drive subscription OAuth
+    (Claude Code print mode). ``ANTHROPIC_API_KEY`` is the obvious API-key path;
+    ``ANTHROPIC_AUTH_TOKEN``/``ANTHROPIC_BASE_URL`` are the documented
+    *alternate*/custom-gateway auth path — leaving any of them in the
+    environment would silently route inference through a metered or custom
+    endpoint, undercutting the subscription-OAuth-only billing guarantee. This
+    scrub is the core billing safeguard for the provider — do not remove it.
+    (Note: ``ANTHROPIC_TOKEN`` is Hermes-managed OAuth, unrelated to the child
+    CLI's own auth, and is intentionally left intact.)
     """
 
     env = os.environ.copy()
     env["HOME"] = _resolve_home_dir()
     env.pop("ANTHROPIC_API_KEY", None)
+    env.pop("ANTHROPIC_AUTH_TOKEN", None)
+    env.pop("ANTHROPIC_BASE_URL", None)
     return env
 
 

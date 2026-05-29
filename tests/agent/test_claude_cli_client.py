@@ -2,8 +2,9 @@
 from __future__ import annotations
 import json
 import os as _os
+import subprocess
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from agent.claude_cli_client import (
     ClaudeCliClient,
     _build_subprocess_env,
@@ -292,6 +293,115 @@ class ClientFacadeTests(unittest.TestCase):
             env = _build_subprocess_env()
             self.assertNotIn("ANTHROPIC_API_KEY", env)
             self.assertIn("HOME", env)
+
+    def test_subprocess_env_scrubs_alternate_anthropic_auth_vars(self):
+        # The documented alternate / custom-gateway auth path must also be
+        # scrubbed so inference can never be routed through a metered or custom
+        # endpoint, undercutting the subscription-OAuth-only billing guarantee.
+        with patch.dict(
+            _os.environ,
+            {
+                "ANTHROPIC_API_KEY": "sk-ant-api-should-be-removed",
+                "ANTHROPIC_AUTH_TOKEN": "token-should-be-removed",
+                "ANTHROPIC_BASE_URL": "https://metered.example.com",
+                "ANTHROPIC_TOKEN": "hermes-managed-oauth-keep-me",
+            },
+            clear=False,
+        ):
+            env = _build_subprocess_env()
+            self.assertNotIn("ANTHROPIC_API_KEY", env)
+            self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
+            self.assertNotIn("ANTHROPIC_BASE_URL", env)
+            # ANTHROPIC_TOKEN is Hermes-managed OAuth and must be left intact.
+            self.assertEqual(env.get("ANTHROPIC_TOKEN"), "hermes-managed-oauth-keep-me")
+            self.assertIn("HOME", env)
+
+
+_SUCCESS_RESULT_LINE = json.dumps({
+    "type": "result",
+    "subtype": "success",
+    "is_error": False,
+    "api_error_status": None,
+    "stop_reason": "end_turn",
+    "result": "ok",
+    "usage": {},
+    "total_cost_usd": 0.0,
+})
+
+
+class RunClaudeSubprocessTests(unittest.TestCase):
+    """Exercise the real ``_run_claude`` subprocess body (no real subprocess).
+
+    The ClientFacadeTests stub ``_run_claude`` wholesale, so the riskiest code —
+    the subprocess spawn, timeout reap, and returncode handling — is otherwise
+    untested. These patch ``subprocess.Popen`` at the module-qualified name and
+    shape a ``MagicMock`` proc to match the exact call/attribute sequence
+    ``_run_claude`` uses.
+    """
+
+    def _client(self):
+        return ClaudeCliClient(model="claude-opus-4-8")
+
+    def test_timeout_kills_and_reaps(self):
+        # Highest-value test: guards the zombie-reap guarantee. On timeout,
+        # _run_claude must kill the proc and call communicate() a SECOND time to
+        # reap it, then raise a "timed out" ClaudeCliError.
+        client = self._client()
+        mock_proc = MagicMock()
+        mock_proc.communicate.side_effect = [
+            subprocess.TimeoutExpired(cmd="claude", timeout=900.0),
+            ("", ""),
+        ]
+        with patch("agent.claude_cli_client.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
+            with self.assertRaises(ClaudeCliError) as cm:
+                client._run_claude("p", "sys", "claude-opus-4-8", 900.0)
+        self.assertIn("timed out", str(cm.exception))
+        mock_proc.kill.assert_called_once()
+        self.assertEqual(mock_proc.communicate.call_count, 2)
+
+    def test_file_not_found_raises_auth_error(self):
+        client = self._client()
+        with patch("agent.claude_cli_client.subprocess.Popen") as mock_popen:
+            mock_popen.side_effect = FileNotFoundError()
+            with self.assertRaises(ClaudeCliAuthError) as cm:
+                client._run_claude("p", "sys", "claude-opus-4-8", 900.0)
+        self.assertIn("not found", str(cm.exception))
+
+    def test_nonzero_returncode_empty_stdout_raises_with_stderr(self):
+        client = self._client()
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = ("", "some stderr boom")
+        mock_proc.returncode = 2
+        with patch("agent.claude_cli_client.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
+            with self.assertRaises(ClaudeCliError) as cm:
+                client._run_claude("p", "sys", "claude-opus-4-8", 900.0)
+        self.assertIn("boom", str(cm.exception))
+
+    def test_nonzero_returncode_with_parseable_stdout_returns_lines(self):
+        # rc != 0 but stdout carries a parseable success result line: _run_claude
+        # must NOT raise and must defer to the parser by returning the lines.
+        client = self._client()
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = (_SUCCESS_RESULT_LINE + "\n", "")
+        mock_proc.returncode = 1
+        with patch("agent.claude_cli_client.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
+            lines = client._run_claude("p", "sys", "claude-opus-4-8", 900.0)
+        self.assertEqual(lines, [_SUCCESS_RESULT_LINE])
+        # Parser later yields "ok" from these lines.
+        self.assertEqual(_parse_stream_json_lines(lines).text, "ok")
+
+    def test_success_clears_active_process(self):
+        client = self._client()
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = (_SUCCESS_RESULT_LINE + "\n", "")
+        mock_proc.returncode = 0
+        with patch("agent.claude_cli_client.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
+            client._run_claude("p", "sys", "claude-opus-4-8", 900.0)
+        self.assertIsNone(client._active_process)
 
 
 if __name__ == "__main__":
