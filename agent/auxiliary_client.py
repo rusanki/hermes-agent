@@ -189,6 +189,8 @@ _PROVIDER_ALIASES = {
     "github-models": "copilot",
     "github-copilot-acp": "copilot-acp",
     "copilot-acp-agent": "copilot-acp",
+    "claude-code-cli": "claude-cli",
+    "claude_subscription": "claude-cli",
     "tencent": "tencent-tokenhub",
     "tokenhub": "tencent-tokenhub",
     "tencent-cloud": "tencent-tokenhub",
@@ -4140,6 +4142,32 @@ def resolve_provider_client(
                 base_url=base_url,
                 command=command,
                 args=args,
+            )
+            logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
+            return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                    else (client, final_model))
+        if provider == "claude-cli":
+            # Route ALL Anthropic auxiliary traffic (context compression,
+            # session-title generation, vision side-tasks) through the
+            # ``claude -p`` SUBPROCESS — never the direct-HTTP Anthropic OAuth
+            # path (build_anthropic_client), which would silently bill against
+            # "extra usage".  Default to a CHEAP aux model so side-tasks stay
+            # inexpensive and so we never trip the empty-model (None,None) guard
+            # for lack of a configured model.
+            if not final_model:
+                final_model = _normalize_resolved_model("claude-haiku-4-5", provider)
+            command = str(creds.get("command", "")).strip() or None
+            args = list(creds.get("args") or [])
+            api_key = str(creds.get("api_key", "")).strip() or None
+            base_url = str(creds.get("base_url", "")).strip() or None
+            from agent.claude_cli_client import ClaudeCliClient
+
+            client = ClaudeCliClient(
+                api_key=api_key,
+                base_url=base_url,
+                command=command,
+                args=args,
+                model=final_model,
             )
             logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
             return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
