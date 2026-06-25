@@ -1,5 +1,7 @@
 """Unit tests for the claude-cli provider client (no real subprocess)."""
 from __future__ import annotations
+import asyncio
+import base64
 import json
 import os as _os
 import subprocess
@@ -245,7 +247,7 @@ class StreamParserTests(unittest.TestCase):
 class ClientFacadeTests(unittest.TestCase):
     def _client_with_output(self, lines):
         client = ClaudeCliClient(model="claude-opus-4-8")
-        client._run_claude = lambda prompt, system_prompt, model, timeout: list(lines)
+        client._run_claude = lambda prompt, system_prompt, model, timeout, image_dir=None: list(lines)
         return client
 
     def test_text_response_shape(self):
@@ -315,6 +317,61 @@ class ClientFacadeTests(unittest.TestCase):
             # ANTHROPIC_TOKEN is Hermes-managed OAuth and must be left intact.
             self.assertEqual(env.get("ANTHROPIC_TOKEN"), "hermes-managed-oauth-keep-me")
             self.assertIn("HOME", env)
+
+
+class ClientAwaitableCreateTests(unittest.TestCase):
+    """``chat.completions.create`` must work BOTH awaited and un-awaited.
+
+    The primary conversation loop consumes the result directly (no ``await``),
+    but the auxiliary/async path — used by ``vision_analyze`` via
+    ``auxiliary_client.async_call_llm`` / ``_retry_same_provider_async`` — does
+    ``response = await client.chat.completions.create(**kwargs)``
+    (see ``agent/auxiliary_client.py`` and ``tools/vision_tools.py``).  A bare
+    ``SimpleNamespace`` return value crashes that path with
+    ``TypeError: object types.SimpleNamespace can't be used in 'await'
+    expression``, which is the image-reading failure on the claude-cli provider.
+    """
+
+    def _client_with_output(self, lines):
+        client = ClaudeCliClient(model="claude-opus-4-8")
+        client._run_claude = lambda prompt, system_prompt, model, timeout, image_dir=None: list(lines)
+        return client
+
+    _LINES = [
+        json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "api_error_status": None, "stop_reason": "end_turn",
+            "result": "a cat on a mat",
+            "usage": {"input_tokens": 9, "output_tokens": 4},
+            "total_cost_usd": 0.001,
+        })
+    ]
+
+    def test_create_result_is_awaitable_for_async_aux_path(self):
+        # Reproduces the vision-tool crash: the aux/async path awaits create().
+        client = self._client_with_output(self._LINES)
+
+        async def _call():
+            return await client.chat.completions.create(
+                model="claude-opus-4-8",
+                messages=[{"role": "user", "content": "describe this image"}],
+            )
+
+        resp = asyncio.run(_call())
+        self.assertEqual(resp.choices[0].message.content, "a cat on a mat")
+        self.assertEqual(resp.usage.prompt_tokens, 9)
+
+    def test_create_result_still_usable_without_await(self):
+        # Regression guard: the primary path consumes the result directly,
+        # reading attributes off it without awaiting.  Must keep working.
+        client = self._client_with_output(self._LINES)
+        resp = client.chat.completions.create(
+            model="claude-opus-4-8",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        self.assertEqual(resp.choices[0].message.content, "a cat on a mat")
+        self.assertEqual(resp.choices[0].finish_reason, "stop")
+        self.assertEqual(resp.usage.completion_tokens, 4)
 
 
 _SUCCESS_RESULT_LINE = json.dumps({
@@ -402,6 +459,152 @@ class RunClaudeSubprocessTests(unittest.TestCase):
             mock_popen.return_value = mock_proc
             client._run_claude("p", "sys", "claude-opus-4-8", 900.0)
         self.assertIsNone(client._active_process)
+
+
+# 1x1 transparent PNG, base64 — a minimal real image payload.
+_PNG_1PX_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9"
+    "awAAAABJRU5ErkJggg=="
+)
+_PNG_1PX_DATA_URL = f"data:image/png;base64,{_PNG_1PX_B64}"
+
+
+class ImageExtractionTests(unittest.TestCase):
+    """``_extract_image_data_urls`` pulls inline base64 images out of messages.
+
+    The auxiliary vision path (``vision_analyze``) sends the image as an OpenAI
+    ``image_url`` content part whose ``url`` is a ``data:<mime>;base64,...`` URL.
+    The ``claude`` CLI cannot ingest inline base64 in ``--print`` mode, so the
+    client must recover the raw bytes to materialise them as a file the CLI's
+    Read tool can open.
+    """
+
+    def test_extracts_base64_image_part(self):
+        from agent.claude_cli_client import _extract_image_data_urls
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is this"},
+                    {"type": "image_url", "image_url": {"url": _PNG_1PX_DATA_URL}},
+                ],
+            }
+        ]
+        images = _extract_image_data_urls(messages)
+        self.assertEqual(len(images), 1)
+        mime, raw = images[0]
+        self.assertEqual(mime, "image/png")
+        self.assertEqual(raw, base64.b64decode(_PNG_1PX_B64))
+
+    def test_no_images_returns_empty(self):
+        from agent.claude_cli_client import _extract_image_data_urls
+        messages = [{"role": "user", "content": "just text"}]
+        self.assertEqual(_extract_image_data_urls(messages), [])
+
+
+class VisionRoutingTests(unittest.TestCase):
+    """When a turn carries an image, the client materialises it to a file and
+    invokes the CLI with Read-tool access + the file path in the prompt.
+
+    This is the path-based vision mechanism: ``claude -p`` reads the image via
+    its own Read tool (``--allowedTools Read`` + ``--add-dir``) rather than
+    receiving inline base64 (which it cannot accept)."""
+
+    def _client(self):
+        return ClaudeCliClient(model="claude-opus-4-8")
+
+    def test_image_turn_invokes_run_claude_with_image_dir_and_path(self):
+        client = self._client()
+        captured = {}
+
+        def _fake_run(prompt, system_prompt, model, timeout, image_dir=None):
+            captured["prompt"] = prompt
+            captured["image_dir"] = image_dir
+            return [json.dumps({
+                "type": "result", "subtype": "success", "is_error": False,
+                "api_error_status": None, "stop_reason": "end_turn",
+                "result": "a tiny image", "usage": {},
+            })]
+
+        client._run_claude = _fake_run
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe the image"},
+                    {"type": "image_url", "image_url": {"url": _PNG_1PX_DATA_URL}},
+                ],
+            }
+        ]
+        resp = client.chat.completions.create(model="claude-opus-4-8", messages=messages)
+        self.assertEqual(resp.choices[0].message.content, "a tiny image")
+        # _run_claude must have been told where the image lives...
+        self.assertIsNotNone(captured.get("image_dir"))
+        # ...and a concrete .png file must exist in that dir during the call,
+        # with the path surfaced in the prompt so the model knows to Read it.
+        self.assertIn(".png", captured["prompt"])
+        self.assertIn(str(captured["image_dir"]), captured["prompt"])
+
+    def test_text_only_turn_passes_no_image_dir(self):
+        client = self._client()
+        captured = {}
+
+        def _fake_run(prompt, system_prompt, model, timeout, image_dir=None):
+            captured["image_dir"] = image_dir
+            return [json.dumps({
+                "type": "result", "subtype": "success", "is_error": False,
+                "api_error_status": None, "stop_reason": "end_turn",
+                "result": "hi", "usage": {},
+            })]
+
+        client._run_claude = _fake_run
+        client.chat.completions.create(
+            model="claude-opus-4-8",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+        self.assertIsNone(captured["image_dir"])
+
+
+class RunClaudeImageArgsTests(unittest.TestCase):
+    """``_run_claude`` grants scoped Read access only when an image dir is set."""
+
+    def _client(self):
+        client = ClaudeCliClient(model="claude-opus-4-8")
+        return client
+
+    def _run_and_capture_cmd(self, image_dir):
+        client = self._client()
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = (
+            json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                        "api_error_status": None, "stop_reason": "end_turn",
+                        "result": "ok", "usage": {}}) + "\n",
+            "",
+        )
+        mock_proc.returncode = 0
+        with patch("agent.claude_cli_client.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
+            client._run_claude("p", "sys", "claude-opus-4-8", 900.0, image_dir=image_dir)
+            (args, _kwargs) = mock_popen.call_args
+        return list(args[0])
+
+    def test_image_dir_enables_read_tool_and_add_dir(self):
+        cmd = self._run_and_capture_cmd("/tmp/some-img-dir")
+        self.assertIn("--allowedTools", cmd)
+        self.assertIn("Read", cmd)
+        self.assertIn("--add-dir", cmd)
+        self.assertIn("/tmp/some-img-dir", cmd)
+        # The blanket tool-disable must NOT be present for image turns
+        # (it would suppress Read).
+        joined = " ".join(cmd)
+        self.assertNotIn('--tools  ', f" {joined} ")  # no `--tools ""` pair
+
+    def test_no_image_dir_keeps_tools_disabled(self):
+        cmd = self._run_and_capture_cmd(None)
+        self.assertIn("--tools", cmd)
+        # Read tool must NOT be granted on a plain text turn.
+        self.assertNotIn("--allowedTools", cmd)
+        self.assertNotIn("--add-dir", cmd)
 
 
 if __name__ == "__main__":

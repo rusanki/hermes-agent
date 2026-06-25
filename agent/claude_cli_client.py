@@ -29,16 +29,32 @@ The subprocess client class itself is added in a later task.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import os
 import re
 import subprocess
 import threading
+import uuid
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# OpenAI-style ``image_url`` data URLs we recover into files for the CLI's
+# Read tool.  ``claude -p`` cannot ingest inline base64, so a turn that carries
+# an image is materialised to a temp file and read by path instead.
+_DATA_URL_RE = re.compile(r"^data:(?P<mime>[\w./+-]+);base64,(?P<b64>.*)$", re.DOTALL)
+_MIME_EXTENSIONS = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+}
 
 CLAUDE_CLI_MARKER_BASE_URL = "claude-cli://local"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
@@ -70,6 +86,68 @@ def _render_message_content(content: Any) -> str:
                     parts.append(text.strip())
         return "\n".join(parts).strip()
     return str(content).strip()
+
+
+def _extract_image_data_urls(
+    messages: list[dict[str, Any]] | None,
+) -> list[tuple[str, bytes]]:
+    """Recover inline ``image_url`` base64 payloads from OpenAI-style messages.
+
+    The auxiliary vision path (``vision_analyze``) attaches the image as a
+    content part ``{"type": "image_url", "image_url": {"url": "data:<mime>;
+    base64,<...>"}}``.  ``claude -p`` cannot consume inline base64, so the bytes
+    are pulled out here to be written to a file the CLI's Read tool can open.
+
+    Returns a list of ``(mime, raw_bytes)`` in document order.  Non-data-URL
+    image refs (bare https URLs) are ignored — the CLI cannot fetch those in
+    ``--print`` mode either, and the caller has no file to point Read at.
+    """
+    out: list[tuple[str, bytes]] = []
+    for message in messages or []:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not isinstance(item, dict) or item.get("type") != "image_url":
+                continue
+            image_url = item.get("image_url")
+            url = ""
+            if isinstance(image_url, dict):
+                url = str(image_url.get("url") or "")
+            elif isinstance(image_url, str):
+                url = image_url
+            m = _DATA_URL_RE.match(url.strip())
+            if not m:
+                continue
+            try:
+                raw = base64.b64decode(m.group("b64"), validate=False)
+            except (ValueError, binascii.Error):
+                continue
+            if raw:
+                out.append((m.group("mime").lower(), raw))
+    return out
+
+
+def _augment_prompt_with_image_paths(prompt: str, image_paths: list[str]) -> str:
+    """Tell the model to open the materialised image file(s) with its Read tool.
+
+    The image bytes were stripped from the prompt (the CLI can't take inline
+    base64), so the model has to be told the on-disk path(s) and explicitly
+    directed to Read them, or it answers "I don't see an image".
+    """
+    if not image_paths:
+        return prompt
+    listing = "\n".join(f"- {p}" for p in image_paths)
+    instruction = (
+        "The user's message refers to "
+        f"{'an image' if len(image_paths) == 1 else 'images'} provided as "
+        f"{'a local file' if len(image_paths) == 1 else 'local files'}. "
+        "Use the Read tool to open "
+        f"{'this file' if len(image_paths) == 1 else 'these files'} and base "
+        "your answer on what the image actually shows:\n"
+        f"{listing}"
+    )
+    return f"{instruction}\n\n{prompt}" if prompt else instruction
 
 
 def _split_system_message(
@@ -553,12 +631,52 @@ TOOL_MARKUP_INSTRUCTION = (
 )
 
 
+class _AwaitableResponse:
+    """A resolved chat-completion response that is usable awaited OR directly.
+
+    ``_create_chat_completion`` runs the ``claude`` CLI synchronously (a blocking
+    subprocess), so the response is fully materialised before this wrapper is
+    constructed.  Two call sites consume it with different conventions and BOTH
+    must work:
+
+    * The primary conversation loop reads attributes off the result directly
+      (no ``await``) — streaming is disabled for this client, so it treats the
+      response as a plain blocking value.
+    * The auxiliary/async path (``auxiliary_client.async_call_llm`` /
+      ``_retry_same_provider_async``, reached by ``vision_analyze``) does
+      ``response = await client.chat.completions.create(**kwargs)``.
+
+    Returning a bare ``SimpleNamespace`` satisfies only the first and crashes the
+    second with ``TypeError: object types.SimpleNamespace can't be used in
+    'await' expression``.  This wrapper proxies attribute access to the resolved
+    response (primary path) and implements ``__await__`` to yield that same
+    response (async aux/vision path).
+    """
+
+    __slots__ = ("_resolved",)
+
+    def __init__(self, resolved: Any):
+        object.__setattr__(self, "_resolved", resolved)
+
+    def __await__(self):
+        # Already-resolved value; hand it back without yielding to the loop.
+        async def _identity() -> Any:
+            return self._resolved
+        return _identity().__await__()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._resolved, name)
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostic aid only
+        return f"_AwaitableResponse({self._resolved!r})"
+
+
 class _ChatCompletions:
     def __init__(self, client: "ClaudeCliClient"):
         self._client = client
 
     def create(self, **kwargs: Any) -> Any:
-        return self._client._create_chat_completion(**kwargs)
+        return _AwaitableResponse(self._client._create_chat_completion(**kwargs))
 
 
 class _ChatNamespace:
@@ -603,6 +721,55 @@ class ClaudeCliClient:
             return system_text + "\n\n" + TOOL_MARKUP_INSTRUCTION
         return TOOL_MARKUP_INSTRUCTION
 
+    def _materialize_images(
+        self, messages: list[dict[str, Any]] | None,
+    ) -> tuple[str | None, list[str]]:
+        """Write any inline base64 images to a fresh scratch dir as files.
+
+        Returns ``(image_dir, paths)``.  ``image_dir`` is ``None`` when the turn
+        carries no inline images, so the normal no-tools inference path runs
+        unchanged.  The dir is per-call and removed by ``_cleanup_image_dir``.
+        """
+        images = _extract_image_data_urls(messages)
+        if not images:
+            return None, []
+        try:
+            from hermes_constants import get_hermes_dir
+            base_dir = get_hermes_dir("cache/claude_cli_vision", "claude_cli_vision")
+        except Exception:
+            base_dir = Path(os.path.join(os.path.expanduser("~"), ".hermes",
+                                         "cache", "claude_cli_vision"))
+        call_dir = Path(base_dir) / f"img_{uuid.uuid4().hex}"
+        try:
+            call_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            logger.warning("claude-cli: could not create image scratch dir %s", call_dir)
+            return None, []
+        paths: list[str] = []
+        for idx, (mime, raw) in enumerate(images):
+            ext = _MIME_EXTENSIONS.get(mime, ".png")
+            fpath = call_dir / f"image_{idx}{ext}"
+            try:
+                fpath.write_bytes(raw)
+            except OSError:
+                logger.warning("claude-cli: failed writing image file %s", fpath)
+                continue
+            paths.append(str(fpath))
+        if not paths:
+            self._cleanup_image_dir(str(call_dir))
+            return None, []
+        return str(call_dir), paths
+
+    @staticmethod
+    def _cleanup_image_dir(image_dir: str | None) -> None:
+        if not image_dir:
+            return
+        try:
+            import shutil
+            shutil.rmtree(image_dir, ignore_errors=True)
+        except Exception:  # pragma: no cover - best-effort cleanup
+            pass
+
     def close(self) -> None:
         proc: subprocess.Popen[str] | None
         with self._active_process_lock:
@@ -635,7 +802,19 @@ class ClaudeCliClient:
         sys_prompt = self._build_system_prompt(system_text)
         eff_model = _normalize_model(model or self._default_model)
 
-        lines = self._run_claude(prompt, sys_prompt, eff_model, timeout)
+        # ``claude -p`` cannot accept inline base64 images, but Opus is natively
+        # multimodal and the CLI can open a local file via its Read tool.  So if
+        # the turn carries images, write them to a scratch dir and let the CLI
+        # read them by path (see ``_run_claude`` ``image_dir`` handling).
+        image_dir, image_paths = self._materialize_images(messages)
+        try:
+            if image_paths:
+                prompt = _augment_prompt_with_image_paths(prompt, image_paths)
+            lines = self._run_claude(
+                prompt, sys_prompt, eff_model, timeout, image_dir=image_dir,
+            )
+        finally:
+            self._cleanup_image_dir(image_dir)
         parsed = _parse_stream_json_lines(lines)
         tool_calls, cleaned = _extract_tool_calls_from_text(parsed.text)
 
@@ -666,6 +845,7 @@ class ClaudeCliClient:
         system_prompt: str,
         model: str,
         timeout: float | None,
+        image_dir: str | None = None,
     ) -> list[str]:
         # Normalise timeout: run_agent.py may pass an httpx.Timeout object
         # (used natively by the OpenAI SDK) rather than a plain float.
@@ -683,6 +863,19 @@ class ClaudeCliClient:
             numeric = [float(v) for v in candidates if isinstance(v, (int, float))]
             effective_timeout = max(numeric) if numeric else _DEFAULT_TIMEOUT_SECONDS
 
+        # Tool policy: by default the CLI is a pure inference engine with ALL
+        # tools disabled (Hermes owns the tool loop).  The single exception is a
+        # turn carrying an image — the CLI cannot ingest inline base64, so we
+        # grant a NARROW, scoped capability: only the ``Read`` tool, only within
+        # the per-call image scratch dir, so the model can open the image file.
+        if image_dir:
+            tool_args = [
+                "--allowedTools", "Read",
+                "--add-dir", image_dir,
+            ]
+        else:
+            tool_args = ["--tools", ""]
+
         cmd = [
             self._command,
             "-p",
@@ -691,8 +884,7 @@ class ClaudeCliClient:
             "--verbose",
             "--input-format",
             "text",
-            "--tools",
-            "",
+            *tool_args,
             "--setting-sources",
             "",
             "--strict-mcp-config",
