@@ -49,6 +49,14 @@ from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context
 logger = logging.getLogger(__name__)
 
 
+def _get_user_id_for_hooks() -> str:
+    try:
+        from gateway.session_context import get_session_user_id
+        return get_session_user_id()
+    except Exception:
+        return ""
+
+
 def _budget_for_agent(agent) -> BudgetConfig:
     """Resolve a tool-result BudgetConfig scaled to the agent's context window.
 
@@ -402,6 +410,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     turn_id=getattr(agent, "_current_turn_id", "") or "",
                     api_request_id=getattr(agent, "_current_api_request_id", "") or "",
                     middleware_trace=list(middleware_trace),
+                    user_id=_get_user_id_for_hooks(),
                 )
             except Exception:
                 block_message = None
@@ -931,6 +940,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     turn_id=getattr(agent, "_current_turn_id", "") or "",
                     api_request_id=getattr(agent, "_current_api_request_id", "") or "",
                     middleware_trace=list(middleware_trace),
+                    user_id=_get_user_id_for_hooks(),
                 )
             except Exception:
                 pass

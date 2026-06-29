@@ -1913,6 +1913,7 @@ def get_pre_tool_call_block_message(
     turn_id: str = "",
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
+    user_id: str = "",
 ) -> Optional[str]:
     """Check ``pre_tool_call`` hooks for a blocking directive.
 
@@ -1940,6 +1941,7 @@ def get_pre_tool_call_block_message(
         turn_id=turn_id,
         api_request_id=api_request_id,
         middleware_trace=list(middleware_trace or []),
+        user_id=user_id,
     )
 
     for result in hook_results:

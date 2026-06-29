@@ -235,6 +235,11 @@ def get_session_env(name: str, default: str = "") -> str:
     return os.getenv(name, default)
 
 
+def get_session_user_id() -> str:
+    v = _SESSION_USER_ID.get()
+    return "" if v is _UNSET else str(v or "")
+
+
 def async_delivery_supported() -> bool:
     """Whether the current session can deliver a background completion later.
 
