@@ -55,5 +55,8 @@ def test_handle_fail_open_on_policy_error(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(m, "AUDIT_PATH", str(audit))
     out = m.handle({"tool_name": "terminal", "session_id": "s1", "extra": {"user_id": "U_X"}})
     assert out == {}  # FAIL-OPEN (allow)
-    assert "policy_load_error" in audit.read_text()   # observable
-    assert "policy_load_error" in capsys.readouterr().err or audit.read_text()  # stderr warning too
+    assert "policy_load_error" in audit.read_text()   # observable in the audit log
+    # stderr warning must ALSO be emitted (a broken policy must be visible, not silent).
+    # NOTE: this pins the stderr behavior specifically — do NOT weaken to
+    # `... or audit.read_text()`, which is always truthy and tests nothing.
+    assert "failing open" in capsys.readouterr().err
