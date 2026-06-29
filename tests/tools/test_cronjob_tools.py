@@ -581,3 +581,104 @@ class TestLocalDeliveryNotice:
         )
         assert created["deliver"] == "origin"
         assert "local-only cron job" not in created["message"]
+
+
+# =========================================================================
+# Per-user ownership scoping (list filter + manage guard by origin.user_id)
+# =========================================================================
+
+def _job(job_id, user_id):
+    """Synthetic job record with an owner (or no owner when user_id is None)."""
+    origin = {"platform": "telegram", "chat_id": "c"}
+    if user_id is not None:
+        origin["user_id"] = user_id
+    return {
+        "id": job_id,
+        "name": f"job-{job_id}",
+        "prompt": "do thing",
+        "schedule_display": "every 1h",
+        "enabled": True,
+        "origin": origin,
+    }
+
+
+class TestCronjobOwnership:
+    """``cronjob`` list/manage must be scoped to the requesting user.
+
+    Mocks at the ``cronjob_tools`` seam: ``list_jobs`` returns synthetic jobs,
+    ``get_session_user_id`` controls the current user, and ``resolve_job_ref``
+    feeds the manage guard a chosen job.
+    """
+
+    def test_list_filters_to_current_user(self, monkeypatch):
+        import tools.cronjob_tools as ct
+
+        jobs = [_job("AAA", "U_A"), _job("BBB", "U_B"), _job("OWNERLESS", None)]
+        monkeypatch.setattr(ct, "list_jobs", lambda include_disabled=False: list(jobs))
+        monkeypatch.setattr(ct, "get_session_user_id", lambda: "U_A")
+
+        listing = json.loads(cronjob(action="list"))
+
+        assert listing["success"] is True
+        ids = {j["job_id"] for j in listing["jobs"]}
+        assert ids == {"AAA"}  # not U_B's, not the owner-less/legacy job
+        assert listing["count"] == 1
+
+    def test_list_no_user_returns_all(self, monkeypatch):
+        # CLI/legacy (no user context) must keep seeing every job, including
+        # owner-less ones — existing behavior preserved.
+        import tools.cronjob_tools as ct
+
+        jobs = [_job("AAA", "U_A"), _job("BBB", "U_B"), _job("OWNERLESS", None)]
+        monkeypatch.setattr(ct, "list_jobs", lambda include_disabled=False: list(jobs))
+        monkeypatch.setattr(ct, "get_session_user_id", lambda: "")
+
+        listing = json.loads(cronjob(action="list"))
+
+        assert listing["success"] is True
+        ids = {j["job_id"] for j in listing["jobs"]}
+        assert ids == {"AAA", "BBB", "OWNERLESS"}
+        assert listing["count"] == 3
+
+    def test_remove_other_users_job_is_not_found(self, monkeypatch):
+        # U_A tries to remove U_B's job → not-found-style error (no leak that it
+        # exists) and the underlying delete is NEVER called.
+        import tools.cronjob_tools as ct
+
+        monkeypatch.setattr(ct, "resolve_job_ref", lambda ref: _job("BBB", "U_B"))
+        monkeypatch.setattr(ct, "get_session_user_id", lambda: "U_A")
+
+        delete_calls = []
+
+        def _boom(job_id):
+            delete_calls.append(job_id)
+            return True
+
+        monkeypatch.setattr(ct, "remove_job", _boom)
+
+        result = json.loads(cronjob(action="remove", job_id="BBB"))
+
+        assert result["success"] is False
+        assert "not found" in result["error"]
+        assert delete_calls == []  # delete path must not be reached
+
+    def test_remove_own_job_proceeds(self, monkeypatch):
+        # U_A removes their OWN job → guard passes and reaches the delete path.
+        import tools.cronjob_tools as ct
+
+        monkeypatch.setattr(ct, "resolve_job_ref", lambda ref: _job("AAA", "U_A"))
+        monkeypatch.setattr(ct, "get_session_user_id", lambda: "U_A")
+        monkeypatch.setattr(ct, "_notify_provider_jobs_changed_safe", lambda: None)
+
+        delete_calls = []
+
+        def _ok(job_id):
+            delete_calls.append(job_id)
+            return True
+
+        monkeypatch.setattr(ct, "remove_job", _ok)
+
+        result = json.loads(cronjob(action="remove", job_id="AAA"))
+
+        assert result["success"] is True
+        assert delete_calls == ["AAA"]  # delete path reached

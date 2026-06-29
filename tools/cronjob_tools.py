@@ -33,6 +33,7 @@ from cron.jobs import (
     resume_job,
     update_job,
 )
+from gateway.session_context import get_session_user_id
 
 
 def _notify_provider_jobs_changed_safe() -> None:
@@ -302,6 +303,30 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
             "user_id": get_session_env("HERMES_SESSION_USER_ID") or None,
         }
     return None
+
+
+def _current_user_id() -> str:
+    """ID of the user making the request, or ``""`` when there's no user context.
+
+    ``""`` covers CLI/TUI/cron-scheduler/legacy callers that never bound a
+    session user — those keep the pre-ownership behavior (see all jobs).
+    """
+    return get_session_user_id() or ""
+
+
+def _job_visible_to(job: Dict[str, Any], current_uid: str) -> bool:
+    """Whether ``job`` should be visible to / operable by ``current_uid``.
+
+    - No user context (``current_uid`` falsy) → True: CLI/legacy/scheduler
+      callers see every job, preserving prior behavior.
+    - Otherwise → True only when the job is owned by this user, i.e.
+      ``origin.user_id == current_uid``. Owner-less jobs (legacy/CLI-created,
+      ``origin.user_id`` missing/None) are NOT shown to a specific user — only
+      the no-user context sees them.
+    """
+    if not current_uid:
+        return True
+    return job.get("origin", {}).get("user_id") == current_uid
 
 
 def _local_delivery_notice(job: Dict[str, Any], user_deliver: Optional[str]) -> Optional[str]:
@@ -674,7 +699,12 @@ def cronjob(
             )
 
         if normalized == "list":
-            jobs = [_format_job(job) for job in list_jobs(include_disabled=include_disabled)]
+            current_uid = _current_user_id()
+            jobs = [
+                _format_job(job)
+                for job in list_jobs(include_disabled=include_disabled)
+                if _job_visible_to(job, current_uid)
+            ]
             return json.dumps({"success": True, "count": len(jobs), "jobs": jobs}, indent=2)
 
         if not job_id:
@@ -700,6 +730,14 @@ def cronjob(
                 indent=2,
             )
         if not job:
+            return json.dumps(
+                {"success": False, "error": f"Job with ID or name '{job_id}' not found. Use cronjob(action='list') to inspect jobs."},
+                indent=2,
+            )
+        # Per-user ownership guard: a user may only manage their own jobs. Use
+        # the same not-found wording (and shape) as above so we never leak that
+        # the job exists for someone else. No-user contexts (CLI/legacy) pass.
+        if not _job_visible_to(job, _current_user_id()):
             return json.dumps(
                 {"success": False, "error": f"Job with ID or name '{job_id}' not found. Use cronjob(action='list') to inspect jobs."},
                 indent=2,
