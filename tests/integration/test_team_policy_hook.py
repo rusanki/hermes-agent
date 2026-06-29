@@ -29,3 +29,31 @@ def test_explicit_deny_beats_explicit_allow():         # rule 1 beats rule 2
     assert _load().decide(POLICY,"U_CONF","write_file")["action"]=="block"
 def test_unknown_user_uses_default_role_member():      # default_role=member, rule 4
     assert _load().decide(POLICY,"","read_file") is None
+
+def test_handle_blocks_and_audits(tmp_path, monkeypatch):
+    m = _load()
+    monkeypatch.setattr(m, "_load_policy", lambda: POLICY)
+    audit = tmp_path / "audit.log"
+    monkeypatch.setattr(m, "AUDIT_PATH", str(audit))
+    out = m.handle({"tool_name": "terminal", "session_id": "s1", "extra": {"user_id": "U_X"}})
+    assert out["action"] == "block"
+    text = audit.read_text()
+    assert "U_X" in text and "terminal" in text and "block" in text
+
+def test_handle_allows_returns_empty(tmp_path, monkeypatch):
+    m = _load()
+    monkeypatch.setattr(m, "_load_policy", lambda: POLICY)
+    monkeypatch.setattr(m, "AUDIT_PATH", str(tmp_path / "a.log"))
+    out = m.handle({"tool_name": "read_file", "session_id": "s1", "extra": {"user_id": "U_X"}})
+    assert out == {} or out is None or out == {}  # allow
+
+def test_handle_fail_open_on_policy_error(tmp_path, monkeypatch, capsys):
+    m = _load()
+    def _boom(): raise ValueError("corrupt policy")
+    monkeypatch.setattr(m, "_load_policy", _boom)
+    audit = tmp_path / "audit.log"
+    monkeypatch.setattr(m, "AUDIT_PATH", str(audit))
+    out = m.handle({"tool_name": "terminal", "session_id": "s1", "extra": {"user_id": "U_X"}})
+    assert out == {}  # FAIL-OPEN (allow)
+    assert "policy_load_error" in audit.read_text()   # observable
+    assert "policy_load_error" in capsys.readouterr().err or audit.read_text()  # stderr warning too

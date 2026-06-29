@@ -34,3 +34,53 @@ def decide(policy, user_id, tool_name):
     if "*" in allow:         # 4
         return None
     return block             # 5
+
+import os, time
+
+POLICY_PATH = os.path.expanduser("~/.hermes/team_policy.json")
+AUDIT_PATH = os.path.expanduser("~/.hermes/logs/team_policy_audit.log")
+
+def _load_policy():
+    with open(POLICY_PATH) as f:
+        return json.load(f)
+
+def _audit(user_id, tool_name, decision, reason=""):
+    try:
+        os.makedirs(os.path.dirname(AUDIT_PATH), exist_ok=True)
+        rec = {"ts": int(time.time()), "user": user_id, "tool": tool_name,
+               "decision": "block" if decision else "allow"}
+        if reason:
+            rec["reason"] = reason
+        with open(AUDIT_PATH, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
+
+def handle(payload):
+    user_id = (payload.get("extra") or {}).get("user_id", "")
+    tool_name = payload.get("tool_name", "")
+    # session_id is TOP-LEVEL (used by the limit task); read it now for forward-compat.
+    session_id = payload.get("session_id", "")  # noqa: F841 (used by a later task)
+    try:
+        policy = _load_policy()
+    except Exception as e:
+        # FAIL-OPEN but OBSERVABLE: a broken policy must not brick the bot,
+        # but must be visible (audit line + stderr) so it's noticed.
+        _audit(user_id, tool_name, None, reason="policy_load_error")
+        print(f"team_policy: policy load failed ({e}); failing open (allowing)", file=sys.stderr)
+        return {}
+    decision = decide(policy, user_id, tool_name)
+    _audit(user_id, tool_name, decision)
+    return decision or {}
+
+def main():
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        print("{}")
+        return
+    out = handle(payload)
+    print(json.dumps(out) if out else "{}")
+
+if __name__ == "__main__":
+    main()
