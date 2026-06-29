@@ -35,10 +35,66 @@ def decide(policy, user_id, tool_name):
         return None
     return block             # 5
 
-import os, time
+import os, time, fcntl
 
 POLICY_PATH = os.path.expanduser("~/.hermes/team_policy.json")
 AUDIT_PATH = os.path.expanduser("~/.hermes/logs/team_policy_audit.log")
+COUNTS_DIR = os.path.expanduser("~/.hermes/cache/team_policy_counts")
+
+# Tools that mutate state and therefore count against a role's per-session cap.
+_MUTATING = {"terminal", "execute_code", "write_file", "patch"}
+
+def _count_path(session_id):
+    return os.path.join(COUNTS_DIR, f"{session_id or 'none'}.json")
+
+def _cap_for(policy, role):
+    """Return the per-session mutating cap for `role`, or None if uncapped.
+
+    Role-level `roles[role].limits.max_mutating_per_session` wins; falls back to
+    top-level `policy['limits'][role].max_mutating_per_session`.
+    """
+    role_limits = ((policy.get("roles") or {}).get(role) or {}).get("limits") or {}
+    cap = role_limits.get("max_mutating_per_session")
+    if cap is None:
+        top = (policy.get("limits") or {}).get(role) or {}
+        cap = top.get("max_mutating_per_session")
+    return cap
+
+def _check_and_increment(session_id, user_id, cap):
+    """flock-guarded read-modify-write of the per-session counts file.
+
+    Returns True (allowed) after incrementing the user's count, or False if the
+    user is already at/over `cap` (no increment). Fail-OPEN (return True) on any
+    OSError so a lock/IO failure never blocks a tool — this is best-effort, not
+    billing-grade.
+    """
+    try:
+        os.makedirs(COUNTS_DIR, exist_ok=True)
+        path = _count_path(session_id)
+        # Open r+ so we hold a single fd for the whole read-modify-write under
+        # the lock; create the file first if it doesn't exist.
+        if not os.path.exists(path):
+            open(path, "a").close()
+        with open(path, "r+") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                raw = f.read().strip()
+                counts = json.loads(raw) if raw else {}
+                if not isinstance(counts, dict):
+                    counts = {}
+                current = counts.get(user_id, 0)
+                if current >= cap:
+                    return False
+                counts[user_id] = current + 1
+                f.seek(0)
+                f.truncate()
+                f.write(json.dumps(counts))
+                f.flush()
+                return True
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+    except OSError:
+        return True  # FAIL-OPEN
 
 def _load_policy():
     with open(POLICY_PATH) as f:
@@ -70,6 +126,19 @@ def handle(payload):
         print(f"team_policy: policy load failed ({e}); failing open (allowing)", file=sys.stderr)
         return {}
     decision = decide(policy, user_id, tool_name)
+    if decision:
+        # Blocked by role allow/deny — it never ran, so no need to count.
+        _audit(user_id, tool_name, decision)
+        return decision
+    # Allowed by role. Enforce the per-session mutating cap (if any) on top.
+    if tool_name in _MUTATING:
+        role = _role_for(policy, user_id)
+        cap = _cap_for(policy, role)
+        if cap is not None and not _check_and_increment(session_id, user_id, cap):
+            block = {"action": "block",
+                     "message": f"Per-session limit reached for '{tool_name}' (max {cap})."}
+            _audit(user_id, tool_name, block, reason="rate_limited")
+            return block
     _audit(user_id, tool_name, decision)
     return decision or {}
 

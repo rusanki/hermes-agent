@@ -60,3 +60,49 @@ def test_handle_fail_open_on_policy_error(tmp_path, monkeypatch, capsys):
     # NOTE: this pins the stderr behavior specifically — do NOT weaken to
     # `... or audit.read_text()`, which is always truthy and tests nothing.
     assert "failing open" in capsys.readouterr().err
+
+# --- per-user, per-session mutating-action limit -------------------------------
+LIMIT_POLICY = {"version":1,"default_role":"member",
+  "roles":{"member":{"allow":["*"],"deny":[],"limits":{"max_mutating_per_session":2}},
+           "admin":{"allow":["*"],"deny":[]}},
+  "users":{"U_ADMIN":{"role":"admin"}}}
+
+def _setup(m, tmp_path, monkeypatch, policy=LIMIT_POLICY):
+    monkeypatch.setattr(m, "_load_policy", lambda: policy)
+    monkeypatch.setattr(m, "AUDIT_PATH", str(tmp_path/"audit.log"))
+    monkeypatch.setattr(m, "COUNTS_DIR", str(tmp_path/"counts"))
+
+def test_mutating_under_cap_allowed_and_counts(tmp_path, monkeypatch):
+    m=_load(); _setup(m,tmp_path,monkeypatch)
+    p={"tool_name":"write_file","session_id":"s1","extra":{"user_id":"U1"}}
+    assert m.handle(p) == {}            # 1st allowed
+    assert m.handle(p) == {}            # 2nd allowed (cap=2)
+    assert m.handle(p)["action"]=="block"  # 3rd over cap -> block
+
+def test_non_mutating_never_limited(tmp_path, monkeypatch):
+    m=_load(); _setup(m,tmp_path,monkeypatch)
+    p={"tool_name":"read_file","session_id":"s1","extra":{"user_id":"U1"}}
+    for _ in range(5):
+        assert m.handle(p) == {}        # never limited
+
+def test_limit_is_per_user(tmp_path, monkeypatch):
+    m=_load(); _setup(m,tmp_path,monkeypatch)
+    a={"tool_name":"write_file","session_id":"s1","extra":{"user_id":"U_A"}}
+    b={"tool_name":"write_file","session_id":"s1","extra":{"user_id":"U_B"}}
+    m.handle(a); m.handle(a)            # U_A hits cap
+    assert m.handle(a)["action"]=="block"
+    assert m.handle(b) == {}            # U_B independent, still allowed
+
+def test_no_cap_means_unlimited(tmp_path, monkeypatch):
+    m=_load(); _setup(m,tmp_path,monkeypatch)
+    p={"tool_name":"write_file","session_id":"s1","extra":{"user_id":"U_ADMIN"}}  # admin: no limits
+    for _ in range(5):
+        assert m.handle(p) == {}
+
+def test_explicit_deny_still_blocks_before_limit(tmp_path, monkeypatch):
+    # a tool denied by role is blocked regardless of limits (and not counted)
+    pol={"version":1,"default_role":"member",
+         "roles":{"member":{"allow":["*"],"deny":["terminal"],"limits":{"max_mutating_per_session":2}}},"users":{}}
+    m=_load(); _setup(m,tmp_path,monkeypatch,pol)
+    p={"tool_name":"terminal","session_id":"s1","extra":{"user_id":"U1"}}
+    assert m.handle(p)["action"]=="block"
