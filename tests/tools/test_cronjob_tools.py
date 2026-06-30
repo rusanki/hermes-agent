@@ -682,3 +682,170 @@ class TestCronjobOwnership:
 
         assert result["success"] is True
         assert delete_calls == ["AAA"]  # delete path reached
+
+
+# =========================================================================
+# Superadmin role: bypasses per-user scoping (sees & manages ALL jobs)
+# =========================================================================
+
+class TestCronjobSuperadmin:
+    """A ``superadmin`` (per ~/.hermes/team_policy.json) bypasses the per-user
+    filter for oversight/debugging — they see AND manage every user's jobs.
+    Members/admin/viewer stay scoped to their own.
+
+    The policy file read is behind the ``_load_team_policy`` seam so tests never
+    need a real ~/.hermes file: monkeypatch ``cronjob_tools._load_team_policy``.
+    """
+
+    def _policy(self, **roles):
+        """Build a policy dict mapping user_id -> {"role": ...}."""
+        return {"users": {uid: {"role": role} for uid, role in roles.items()}}
+
+    # ---- _is_superadmin unit behavior -----------------------------------
+
+    def test_is_superadmin_true_for_superadmin_role(self, monkeypatch):
+        import tools.cronjob_tools as ct
+
+        monkeypatch.setattr(ct, "_load_team_policy", lambda: self._policy(U_SA="superadmin"))
+        assert ct._is_superadmin("U_SA") is True
+
+    def test_is_superadmin_false_for_other_roles(self, monkeypatch):
+        import tools.cronjob_tools as ct
+
+        policy = self._policy(
+            U_MEM="member", U_ADM="admin", U_VIEW="viewer"
+        )
+        monkeypatch.setattr(ct, "_load_team_policy", lambda: policy)
+        assert ct._is_superadmin("U_MEM") is False
+        assert ct._is_superadmin("U_ADM") is False
+        assert ct._is_superadmin("U_VIEW") is False
+        # Unknown user → falls back to default_role (member) → not superadmin.
+        assert ct._is_superadmin("U_UNKNOWN") is False
+
+    def test_is_superadmin_uses_default_role(self, monkeypatch):
+        import tools.cronjob_tools as ct
+
+        # A default_role of superadmin would make an unmapped user superadmin.
+        monkeypatch.setattr(
+            ct, "_load_team_policy", lambda: {"default_role": "superadmin"}
+        )
+        assert ct._is_superadmin("anybody") is True
+
+    def test_is_superadmin_empty_uid_is_false(self, monkeypatch):
+        import tools.cronjob_tools as ct
+
+        # No user context is NOT a superadmin (CLI/legacy still sees all via the
+        # existing falsy-uid path in _job_visible_to). _load_team_policy must not
+        # even be consulted for an empty uid.
+        def _boom():
+            raise AssertionError("_load_team_policy should not be called for empty uid")
+
+        monkeypatch.setattr(ct, "_load_team_policy", _boom)
+        assert ct._is_superadmin("") is False
+
+    def test_load_team_policy_failsafe_returns_empty_on_error(self, monkeypatch):
+        import tools.cronjob_tools as ct
+
+        # The fail-safe lives in _load_team_policy: ANY file/parse error (missing
+        # file, unreadable, bad JSON) must degrade to {} — never raise.
+        def _boom(*_a, **_k):
+            raise OSError("policy file gone")
+
+        monkeypatch.setattr("builtins.open", _boom)
+        assert ct._load_team_policy() == {}
+
+    def test_is_superadmin_failsafe_on_missing_policy(self, monkeypatch):
+        import tools.cronjob_tools as ct
+
+        # When the policy is absent/broken, _load_team_policy returns {} →
+        # role resolves to default "member" → not superadmin. A broken/absent
+        # policy must NEVER accidentally grant see-all.
+        monkeypatch.setattr(ct, "_load_team_policy", lambda: {})
+        assert ct._is_superadmin("U_SA") is False
+
+    # ---- list as superadmin vs member -----------------------------------
+
+    def test_list_as_superadmin_returns_all_jobs(self, monkeypatch):
+        import tools.cronjob_tools as ct
+
+        jobs = [_job("AAA", "U_A"), _job("BBB", "U_B"), _job("OWNERLESS", None)]
+        monkeypatch.setattr(ct, "list_jobs", lambda include_disabled=False: list(jobs))
+        monkeypatch.setattr(ct, "get_session_user_id", lambda: "U_SA")
+        monkeypatch.setattr(
+            ct, "_load_team_policy", lambda: self._policy(U_SA="superadmin")
+        )
+
+        listing = json.loads(cronjob(action="list"))
+
+        assert listing["success"] is True
+        ids = {j["job_id"] for j in listing["jobs"]}
+        assert ids == {"AAA", "BBB", "OWNERLESS"}  # every user's + owner-less
+        assert listing["count"] == 3
+
+    def test_list_as_member_still_scoped(self, monkeypatch):
+        # Regression: the superadmin short-circuit must NOT leak for non-admins.
+        import tools.cronjob_tools as ct
+
+        jobs = [_job("AAA", "U_A"), _job("BBB", "U_B"), _job("OWNERLESS", None)]
+        monkeypatch.setattr(ct, "list_jobs", lambda include_disabled=False: list(jobs))
+        monkeypatch.setattr(ct, "get_session_user_id", lambda: "U_A")
+        monkeypatch.setattr(
+            ct, "_load_team_policy", lambda: self._policy(U_A="member")
+        )
+
+        listing = json.loads(cronjob(action="list"))
+
+        assert listing["success"] is True
+        ids = {j["job_id"] for j in listing["jobs"]}
+        assert ids == {"AAA"}
+        assert listing["count"] == 1
+
+    # ---- manage (remove) as superadmin vs member ------------------------
+
+    def test_remove_other_users_job_as_superadmin_proceeds(self, monkeypatch):
+        # A superadmin removing ANOTHER user's job → guard passes, delete runs.
+        import tools.cronjob_tools as ct
+
+        monkeypatch.setattr(ct, "resolve_job_ref", lambda ref: _job("BBB", "U_B"))
+        monkeypatch.setattr(ct, "get_session_user_id", lambda: "U_SA")
+        monkeypatch.setattr(
+            ct, "_load_team_policy", lambda: self._policy(U_SA="superadmin")
+        )
+        monkeypatch.setattr(ct, "_notify_provider_jobs_changed_safe", lambda: None)
+
+        delete_calls = []
+
+        def _ok(job_id):
+            delete_calls.append(job_id)
+            return True
+
+        monkeypatch.setattr(ct, "remove_job", _ok)
+
+        result = json.loads(cronjob(action="remove", job_id="BBB"))
+
+        assert result["success"] is True
+        assert delete_calls == ["BBB"]  # delete path reached across the owner
+
+    def test_remove_other_users_job_as_member_still_not_found(self, monkeypatch):
+        # Regression: a plain member still cannot reach another user's job.
+        import tools.cronjob_tools as ct
+
+        monkeypatch.setattr(ct, "resolve_job_ref", lambda ref: _job("BBB", "U_B"))
+        monkeypatch.setattr(ct, "get_session_user_id", lambda: "U_A")
+        monkeypatch.setattr(
+            ct, "_load_team_policy", lambda: self._policy(U_A="member")
+        )
+
+        delete_calls = []
+
+        def _boom(job_id):
+            delete_calls.append(job_id)
+            return True
+
+        monkeypatch.setattr(ct, "remove_job", _boom)
+
+        result = json.loads(cronjob(action="remove", job_id="BBB"))
+
+        assert result["success"] is False
+        assert "not found" in result["error"]
+        assert delete_calls == []

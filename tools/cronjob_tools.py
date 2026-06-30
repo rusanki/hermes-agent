@@ -7,6 +7,7 @@ Compatibility wrappers remain for direct Python callers and legacy tests.
 
 import json
 import logging
+import os
 import re
 import sys
 from pathlib import Path
@@ -314,9 +315,46 @@ def _current_user_id() -> str:
     return get_session_user_id() or ""
 
 
+def _load_team_policy() -> Dict[str, Any]:
+    """Read ``~/.hermes/team_policy.json`` (the same file the pre_tool_call hook
+    uses) and return the parsed dict.
+
+    Fail-safe: on ANY error (missing file, unreadable, malformed JSON, …) return
+    an empty dict. A broken/absent policy must never crash cron — it degrades to
+    normal per-user scoping. Read fresh each call (no caching); cron calls are
+    infrequent and this keeps role changes effective immediately.
+    """
+    try:
+        with open(os.path.expanduser("~/.hermes/team_policy.json")) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _is_superadmin(uid: str) -> bool:
+    """Whether ``uid`` has the ``superadmin`` role per ``team_policy.json``.
+
+    A superadmin bypasses per-user job scoping (see/manage all users' jobs) for
+    oversight/debugging. Role is resolved exactly the way the hook does:
+    ``users[uid].role`` → ``default_role`` → ``"member"``.
+
+    - Falsy ``uid`` → False: no user context is not a superadmin (CLI/legacy
+      still sees everything via the falsy-uid branch of ``_job_visible_to``).
+    - Any policy read/parse error degrades to False (never accidentally grants
+      see-all), since ``_load_team_policy`` returns ``{}`` on failure.
+    """
+    if not uid:
+        return False
+    policy = _load_team_policy()
+    role = (policy.get("users") or {}).get(uid, {}).get("role") or policy.get("default_role") or "member"
+    return role == "superadmin"
+
+
 def _job_visible_to(job: Dict[str, Any], current_uid: str) -> bool:
     """Whether ``job`` should be visible to / operable by ``current_uid``.
 
+    - Superadmin (``current_uid`` truthy and ``_is_superadmin``) → True: full
+      access to every user's jobs for oversight/debugging.
     - No user context (``current_uid`` falsy) → True: CLI/legacy/scheduler
       callers see every job, preserving prior behavior.
     - Otherwise → True only when the job is owned by this user, i.e.
@@ -324,6 +362,8 @@ def _job_visible_to(job: Dict[str, Any], current_uid: str) -> bool:
       ``origin.user_id`` missing/None) are NOT shown to a specific user — only
       the no-user context sees them.
     """
+    if current_uid and _is_superadmin(current_uid):
+        return True
     if not current_uid:
         return True
     return job.get("origin", {}).get("user_id") == current_uid
