@@ -639,6 +639,77 @@ class TestDeliverResultWrapping:
         assert "Cronjob Response" not in sent_content
         assert "The agent cannot see" not in sent_content
 
+    def _wrap_env(self):
+        """Shared setup for per-job wrap_response tests: a Telegram platform mock."""
+        from gateway.config import Platform
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        return mock_cfg
+
+    def test_per_job_wrap_false_overrides_global_true(self):
+        """A job with wrap_response=False delivers clean output even when the
+        global cron.wrap_response is True (the default)."""
+        mock_cfg = self._wrap_env()
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": True}}):
+            job = {
+                "id": "public-digest",
+                "name": "Fintech Digest",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+                "wrap_response": False,
+            }
+            _deliver_result(job, "Just the digest.")
+
+        sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
+        assert sent_content == "Just the digest."
+        assert "Cronjob Response" not in sent_content
+        assert "To stop or manage this job" not in sent_content
+
+    def test_per_job_wrap_true_overrides_global_false(self):
+        """A job with wrap_response=True is wrapped even when the global
+        cron.wrap_response is False."""
+        mock_cfg = self._wrap_env()
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}):
+            job = {
+                "id": "chatty-job",
+                "name": "My Reminder",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+                "wrap_response": True,
+            }
+            _deliver_result(job, "Reminder body.")
+
+        sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
+        assert "Cronjob Response: My Reminder" in sent_content
+        assert "To stop or manage this job" in sent_content
+        assert "Reminder body." in sent_content
+
+    def test_per_job_wrap_unset_falls_back_to_global(self):
+        """A job that does not set wrap_response follows the global setting
+        (here False), preserving backwards-compatible behavior."""
+        mock_cfg = self._wrap_env()
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}):
+            job = {
+                "id": "unset-job",
+                "name": "Unset",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+                # no wrap_response key
+            }
+            _deliver_result(job, "Body.")
+
+        sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
+        assert sent_content == "Body."
+        assert "Cronjob Response" not in sent_content
+
     def test_delivery_extracts_media_tags_before_send(self, tmp_path, monkeypatch):
         """Cron delivery should pass MEDIA attachments separately to the send helper."""
         from gateway.config import Platform
