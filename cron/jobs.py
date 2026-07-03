@@ -789,6 +789,7 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    wrap_response: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -973,6 +974,12 @@ def create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+
+    # Only persist wrap_response when explicitly set, so existing jobs and the
+    # common case stay byte-identical (absent key => fall back to the global
+    # cron.wrap_response, default on). See _deliver_result for resolution.
+    if wrap_response is not None:
+        job["wrap_response"] = bool(wrap_response)
 
     with _jobs_lock():
         jobs = load_jobs()

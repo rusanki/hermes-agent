@@ -249,6 +249,37 @@ class TestJobCRUD:
         assert fetched is not None
         assert fetched["prompt"] == "Check server status"
 
+    def test_create_omits_wrap_response_when_not_set(self, tmp_cron_dir):
+        """A job created without wrap_response must NOT carry the key, so it
+        falls back to the global cron.wrap_response (existing jobs unaffected)."""
+        job = create_job(prompt="No preference", schedule="30m")
+        assert "wrap_response" not in job
+
+    def test_create_persists_wrap_response_false(self, tmp_cron_dir):
+        """wrap_response=False is stored on the job and survives a round-trip."""
+        job = create_job(prompt="Public digest", schedule="30m", wrap_response=False)
+        assert job["wrap_response"] is False
+        fetched = get_job(job["id"])
+        assert fetched["wrap_response"] is False
+
+    def test_create_persists_wrap_response_true(self, tmp_cron_dir):
+        """wrap_response=True is stored (opt-in wrapping when global is off)."""
+        job = create_job(prompt="Chatty", schedule="30m", wrap_response=True)
+        assert job["wrap_response"] is True
+        fetched = get_job(job["id"])
+        assert fetched["wrap_response"] is True
+
+    def test_edit_sets_and_flips_wrap_response(self, tmp_cron_dir):
+        """update_job can set wrap_response on an existing job and flip it."""
+        job = create_job(prompt="Editable", schedule="30m")
+        assert "wrap_response" not in job
+
+        update_job(job["id"], {"wrap_response": False})
+        assert get_job(job["id"])["wrap_response"] is False
+
+        update_job(job["id"], {"wrap_response": True})
+        assert get_job(job["id"])["wrap_response"] is True
+
     def test_list_jobs(self, tmp_cron_dir):
         create_job(prompt="Job 1", schedule="every 1h")
         create_job(prompt="Job 2", schedule="every 2h")

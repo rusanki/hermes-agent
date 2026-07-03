@@ -264,6 +264,38 @@ class TestUnifiedCronjobTool:
         assert listing["jobs"][0]["name"] == "Server Check"
         assert listing["jobs"][0]["state"] == "scheduled"
 
+    def test_create_with_wrap_response_false_persists(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Public digest",
+                schedule="every 1h",
+                name="Digest",
+                wrap_response=False,
+            )
+        )
+        assert created["success"] is True
+        from cron.jobs import get_job
+        assert get_job(created["job_id"])["wrap_response"] is False
+
+    def test_create_without_wrap_response_omits_key(self):
+        created = json.loads(
+            cronjob(action="create", prompt="Normal", schedule="every 1h")
+        )
+        from cron.jobs import get_job
+        assert "wrap_response" not in get_job(created["job_id"])
+
+    def test_update_sets_wrap_response(self):
+        created = json.loads(
+            cronjob(action="create", prompt="Editable", schedule="every 1h")
+        )
+        job_id = created["job_id"]
+        json.loads(cronjob(action="update", job_id=job_id, wrap_response=False))
+        from cron.jobs import get_job
+        assert get_job(job_id)["wrap_response"] is False
+        json.loads(cronjob(action="update", job_id=job_id, wrap_response=True))
+        assert get_job(job_id)["wrap_response"] is True
+
     def test_list_handles_partial_legacy_job_records(self):
         from cron.jobs import save_jobs
 

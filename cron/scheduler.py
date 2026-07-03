@@ -1050,15 +1050,26 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     from gateway.config import load_gateway_config, Platform
 
     # Optionally wrap the content with a header/footer so the user knows this
-    # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
-    # in config.yaml for clean output.
-    wrap_response = True
+    # is a cron delivery.  Resolution is per-job first, then global:
+    #   1. job["wrap_response"] (True/False) wins when set — lets a single job
+    #      (e.g. a wide-audience digest) opt out of the wrapper.
+    #   2. else the global cron.wrap_response in config.yaml.
+    #   3. else True (wrapping on by default).
+    # A job that omits the key (None) falls through to the global — so existing
+    # jobs are unaffected.
     user_cfg = None
     try:
         user_cfg = load_config()
-        wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
     except Exception:
         pass
+    global_wrap = True
+    if user_cfg is not None:
+        try:
+            global_wrap = user_cfg.get("cron", {}).get("wrap_response", True)
+        except Exception:
+            global_wrap = True
+    job_wrap = job.get("wrap_response")
+    wrap_response = global_wrap if job_wrap is None else bool(job_wrap)
 
     if wrap_response:
         task_name = job.get("name", job["id"])
