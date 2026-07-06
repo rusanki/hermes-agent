@@ -7,6 +7,15 @@ I/O wrapper (handle/main), audit, and limits are added in later tasks.
 import json, sys  # sys/json imported now; used by later tasks' main()
 
 def _role_for(policy, user_id):
+    # Cron/scheduled runs invoke tools with user_id="" (no Slack user sent
+    # them). Without this mapping they fall to default_role and inherit
+    # member's denials -- this silently broke a scheduled digest on
+    # 2026-07-01. Map empty/whitespace user_id to a dedicated 'system' role,
+    # but only if the policy actually defines one: policies without a
+    # 'system' role are unaffected (empty uid falls to default_role exactly
+    # as before -- fail-safe, no accidental privilege grant from this alone).
+    if not (user_id or "").strip() and "system" in (policy.get("roles") or {}):
+        return "system"
     u = (policy.get("users") or {}).get(user_id or "")
     return (u or {}).get("role") or policy.get("default_role") or "member"
 

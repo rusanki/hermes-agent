@@ -30,6 +30,35 @@ def test_explicit_deny_beats_explicit_allow():         # rule 1 beats rule 2
 def test_unknown_user_uses_default_role_member():      # default_role=member, rule 4
     assert _load().decide(POLICY,"","read_file") is None
 
+# --- empty/whitespace user_id -> 'system' role (cron/scheduled runs) ----------
+# Cron/scheduled invocations carry user_id="" (no Slack user sent them). Before
+# the 2026-07-01 fix this fell through to default_role=member, which denies
+# `terminal` and silently broke a scheduled digest. This policy fixture defines
+# an explicit `system` role that empty/whitespace user_ids map onto.
+SYSTEM_POLICY = {"version":1,"default_role":"member",
+  "roles":{"system":{"allow":["terminal","read_file","cronjob","send_message"],
+                      "deny":["write_file","patch","execute_code"]},
+           "member":{"allow":["*"],"deny":["terminal"]},
+           "admin":{"allow":["*"],"deny":[]}},
+  "users":{"U_ADMIN":{"role":"admin"},"U_MEM":{"role":"member"}}}
+
+def test_empty_user_id_system_role_allows_terminal():
+    assert _load().decide(SYSTEM_POLICY,"","terminal") is None
+def test_empty_user_id_system_role_blocks_write_file():
+    assert _load().decide(SYSTEM_POLICY,"","write_file")["action"]=="block"
+def test_whitespace_user_id_treated_as_empty_system_role():
+    assert _load().decide(SYSTEM_POLICY,"   ","terminal") is None
+def test_known_member_user_still_denied_terminal_unchanged():
+    assert _load().decide(SYSTEM_POLICY,"U_MEM","terminal")["action"]=="block"
+def test_admin_user_unchanged_with_system_role_present():
+    assert _load().decide(SYSTEM_POLICY,"U_ADMIN","terminal") is None
+def test_unknown_nonempty_user_id_uses_default_role_unchanged():
+    assert _load().decide(SYSTEM_POLICY,"U_UNKNOWN","terminal")["action"]=="block"  # default_role=member denies terminal
+def test_empty_user_id_without_system_role_falls_to_default_role():
+    # POLICY (module-level fixture above) defines no 'system' role: empty uid
+    # must fall to default_role=member exactly as before this change.
+    assert _load().decide(POLICY,"","terminal")["action"]=="block"
+
 def test_handle_blocks_and_audits(tmp_path, monkeypatch):
     m = _load()
     monkeypatch.setattr(m, "_load_policy", lambda: POLICY)
