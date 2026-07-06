@@ -60,7 +60,7 @@ CLAUDE_CLI_MARKER_BASE_URL = "claude-cli://local"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
 _DEFAULT_MODEL = "claude-opus-4-8"
 
-_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 _TOOL_CALL_JSON_RE = re.compile(r"\{\s*\"id\"\s*:\s*\"[^\"]+\"\s*,\s*\"type\"\s*:\s*\"function\"\s*,\s*\"function\"\s*:\s*\{.*?\}\s*\}", re.DOTALL)
 
 

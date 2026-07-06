@@ -117,6 +117,99 @@ class FormatterTests(unittest.TestCase):
         self.assertIn("trailing", cleaned)
         self.assertNotIn("not valid json", cleaned)
 
+    def test_extract_tool_call_with_nested_brace_arguments_object(self):
+        # Regression guard: full nested-brace payloads must extract intact
+        # under the widened `(.*?)` capture. The old `(\{.*?\})` also handled
+        # these via backtracking; the real motivation for the widened capture
+        # is that non-`{`-starting/garbled payloads now match and can be
+        # routed to malformed handling (Task 2) instead of shipping as raw
+        # unmatched text.
+        text = (
+            '<tool_call>{"name":"cronjob","arguments":{"action":"create",'
+            '"job":{"schedule":"0 9 * * *","name":"digest"}}}</tool_call>'
+        )
+        calls, cleaned = _extract_tool_calls_from_text(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].function.name, "cronjob")
+        # function.arguments is stringified in `_try_add_tool_call` since the
+        # parsed "arguments" value here is an object, not already a string.
+        self.assertEqual(
+            json.loads(calls[0].function.arguments),
+            {"action": "create", "job": {"schedule": "0 9 * * *", "name": "digest"}},
+        )
+        self.assertEqual(cleaned, "")
+
+    def test_extract_tool_call_with_escaped_braces_in_argument_string(self):
+        # "arguments" as a JSON string whose contents themselves contain
+        # braces/quotes (escaped) must not confuse the block extraction.
+        text = (
+            '<tool_call>{"name": "write_file", '
+            '"arguments": "{\\"path\\": \\"/tmp/x\\", '
+            '\\"content\\": \\"if (a) { b(); }\\"}"}</tool_call>'
+        )
+        calls, cleaned = _extract_tool_calls_from_text(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].function.name, "write_file")
+        self.assertEqual(
+            json.loads(calls[0].function.arguments),
+            {"path": "/tmp/x", "content": "if (a) { b(); }"},
+        )
+        self.assertEqual(cleaned, "")
+
+    def test_extract_pretty_printed_multiline_tool_call(self):
+        # Pretty-printed JSON (newlines/indentation, nested object) inside the
+        # block must still be captured in full.
+        text = (
+            "<tool_call>\n"
+            "{\n"
+            '  "name": "cronjob",\n'
+            '  "arguments": {\n'
+            '    "action": "create",\n'
+            '    "job": {\n'
+            '      "schedule": "0 9 * * *"\n'
+            "    }\n"
+            "  }\n"
+            "}\n"
+            "</tool_call>"
+        )
+        calls, cleaned = _extract_tool_calls_from_text(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].function.name, "cronjob")
+        self.assertEqual(
+            json.loads(calls[0].function.arguments),
+            {"action": "create", "job": {"schedule": "0 9 * * *"}},
+        )
+        self.assertEqual(cleaned, "")
+
+    def test_two_nested_brace_tool_calls_with_surrounding_prose(self):
+        # Two nested-brace blocks in one message, with prose before/between/
+        # after: both must be extracted in order, and the cleaned text must
+        # retain the prose but no <tool_call> markup.
+        text = (
+            "Sure, I'll do both.\n"
+            '<tool_call>{"name":"cronjob","arguments":{"action":"create",'
+            '"job":{"schedule":"0 9 * * *"}}}</tool_call>\n'
+            "Now the second one.\n"
+            '<tool_call>{"name":"cronjob","arguments":{"action":"delete",'
+            '"job":{"id":"abc"}}}</tool_call>\n'
+            "Done."
+        )
+        calls, cleaned = _extract_tool_calls_from_text(text)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0].function.name, "cronjob")
+        self.assertEqual(calls[1].function.name, "cronjob")
+        self.assertEqual(
+            json.loads(calls[0].function.arguments)["action"], "create"
+        )
+        self.assertEqual(
+            json.loads(calls[1].function.arguments)["action"], "delete"
+        )
+        self.assertIn("Sure, I'll do both.", cleaned)
+        self.assertIn("Now the second one.", cleaned)
+        self.assertIn("Done.", cleaned)
+        self.assertNotIn("<tool_call>", cleaned)
+        self.assertNotIn("</tool_call>", cleaned)
+
     def test_tool_message_with_json_string_content(self):
         # A tool message whose content is a JSON string round-trips as a parsed
         # structure inside the <tool_response> block.
