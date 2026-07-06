@@ -19,3 +19,22 @@ def _default_cron_test_model(monkeypatch):
     """Pin a default HERMES_MODEL so cron run_job tests have a resolvable model."""
     monkeypatch.setenv("HERMES_MODEL", "test-cron-default-model")
     yield
+
+
+@pytest.fixture(autouse=True)
+def _approve_all_cron_scripts_by_default(request, monkeypatch):
+    """Existing cron tests exercise script EXECUTION mechanics, not the approval
+    gate (Task 7). Default them to 'approved' so the run-time pin inside
+    ``_run_job_script`` doesn't block them. Tests that specifically verify the
+    pin opt OUT via the ``real_script_pin`` marker (see
+    ``tests/cron/test_script_pin.py``).
+
+    The gate imports ``is_approved`` function-locally
+    (``from cron.script_registry import is_approved``), so the binding is looked
+    up at call time — patching ``cron.script_registry.is_approved`` here is the
+    seam the scheduler sees.
+    """
+    if request.node.get_closest_marker("real_script_pin"):
+        return
+    import cron.script_registry as sr
+    monkeypatch.setattr(sr, "is_approved", lambda *a, **k: True)

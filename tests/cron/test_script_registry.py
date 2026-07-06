@@ -1,5 +1,10 @@
 import pytest
 
+# These are direct unit tests of cron.script_registry (including is_approved
+# itself), so they must run against the REAL is_approved — opt out of the
+# autouse approval-bypass fixture in conftest.py (Task 7).
+pytestmark = pytest.mark.real_script_pin
+
 
 @pytest.fixture
 def reg_env(tmp_path, monkeypatch):
