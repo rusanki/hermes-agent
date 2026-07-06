@@ -33,6 +33,12 @@ def _approve_all_cron_scripts_by_default(request, monkeypatch):
     (``from cron.script_registry import is_approved``), so the binding is looked
     up at call time — patching ``cron.script_registry.is_approved`` here is the
     seam the scheduler sees.
+
+    RULE FOR FUTURE AUTHORS: any NEW test that intends to exercise the run-time
+    approval gate (assert an unapproved script is blocked, or that an approved
+    one runs) MUST carry ``@pytest.mark.real_script_pin`` — otherwise this
+    default bypass silently stubs the gate to True and the test proves nothing
+    about approval.
     """
     if request.node.get_closest_marker("real_script_pin"):
         return
