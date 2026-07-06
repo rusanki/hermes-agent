@@ -42,6 +42,14 @@ from utils import base_url_host_matches, base_url_hostname, env_var_enabled, ato
 logger = logging.getLogger(__name__)
 
 
+def _get_user_id_for_hooks() -> str:
+    try:
+        from gateway.session_context import get_session_user_id
+        return get_session_user_id()
+    except Exception:
+        return ""
+
+
 def _ra():
     """Lazy ``run_agent`` reference for test-patch routing."""
     import run_agent
@@ -1757,6 +1765,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
                 middleware_trace=list(_tool_middleware_trace),
+                user_id=_get_user_id_for_hooks(),
             )
         except Exception:
             pass

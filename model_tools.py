@@ -34,6 +34,15 @@ from toolsets import resolve_toolset, validate_toolset
 
 logger = logging.getLogger(__name__)
 
+
+def _get_user_id_for_hooks() -> str:
+    try:
+        from gateway.session_context import get_session_user_id
+        return get_session_user_id()
+    except Exception:
+        return ""
+
+
 # Tracks platform-bundle names already flagged in disabled_toolsets so the
 # advisory (#33924) is logged once per name, not on every tool recompute.
 _WARNED_DISABLED_BUNDLES: set = set()
@@ -1066,6 +1075,7 @@ def handle_function_call(
                     turn_id=turn_id or "",
                     api_request_id=api_request_id or "",
                     middleware_trace=list(_tool_middleware_trace),
+                    user_id=_get_user_id_for_hooks(),
                 )
             except Exception as _hook_err:
                 logger.debug("pre_tool_call hook error: %s", _hook_err)
