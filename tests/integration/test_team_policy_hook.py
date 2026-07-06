@@ -226,9 +226,10 @@ def test_gate_admin_cronjob_update_allowed(tmp_path, monkeypatch):
     assert not out
 
 # --- MUST-FIX 2: a non-string action must NOT crash the hook (fail-OPEN=bypass) -
-# A dict/list/int action would raise AttributeError in _required_role. Because
-# the hook's caller treats a crashed hook as NO BLOCK, that fails OPEN and
-# bypasses the gate. The hook must return a dict and never raise.
+# Before the isinstance guard, a dict/list/int action raised AttributeError in
+# _required_role. Because the hook's caller treats a crashed hook as NO BLOCK,
+# that failed OPEN and bypassed the gate. The guard now normalizes non-strings,
+# so the hook returns a dict and never raises.
 def test_gate_nonstring_action_dict_does_not_crash(tmp_path, monkeypatch):
     out = _gate_handle(_load(), "cronjob", {"nested": 1}, "U_MEMBER", tmp_path, monkeypatch)
     assert isinstance(out, dict)   # returned a decision, did not raise
@@ -236,6 +237,23 @@ def test_gate_nonstring_action_dict_does_not_crash(tmp_path, monkeypatch):
 def test_gate_nonstring_action_int_does_not_crash(tmp_path, monkeypatch):
     out = _gate_handle(_load(), "cronjob", 5, "U_MEMBER", tmp_path, monkeypatch)
     assert isinstance(out, dict)   # returned a decision, did not raise
+
+# Belt-and-suspenders: if decide() itself raises unexpectedly, handle() must
+# fail CLOSED for a gated tool (block) and OPEN for a non-gated tool ({}), so a
+# future crash in the decision path can never silently bypass the RBAC gate.
+def test_gate_decide_crash_fails_closed_for_gated_tool(tmp_path, monkeypatch):
+    m = _load()
+    monkeypatch.setattr(m, "_load_policy", lambda: GATE_POLICY)
+    monkeypatch.setattr(m, "AUDIT_PATH", str(tmp_path / "audit.log"))
+    def _boom(*a, **k):
+        raise RuntimeError("decision path exploded")
+    monkeypatch.setattr(m, "decide", _boom)
+    gated = m.handle({"tool_name": "cronjob", "session_id": "s",
+                      "extra": {"user_id": "U_MEMBER"}, "tool_input": {"action": "create"}})
+    assert gated.get("action") == "block"          # gated tool -> fail CLOSED
+    ungated = m.handle({"tool_name": "read_file", "session_id": "s",
+                        "extra": {"user_id": "U_MEMBER"}})
+    assert ungated == {}                            # non-gated tool -> fail OPEN
 
 def test_gate_approve_nonstring_action_still_blocked_for_admin(tmp_path, monkeypatch):
     # cron_script_approve is gated at the TOOL level (action ignored), so a
