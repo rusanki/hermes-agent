@@ -585,6 +585,23 @@ class TestCronApprovedScriptsWriteProtection:
             "echo x | tee $HERMES_HOME/scripts/approved/x.py")
         assert dangerous is True
 
+    def test_perl_in_place_approved_registry(self):
+        # perl -i is wired into the same in-place-edit pattern as sed -i; guard it.
+        dangerous, key, desc = detect_dangerous_command(
+            "perl -i -pe 's/a/b/' ~/.hermes/cron/approved_scripts.json")
+        assert dangerous is True
+
+    def test_ruby_in_place_approved_registry(self):
+        dangerous, key, desc = detect_dangerous_command(
+            "ruby -i -pe 'gsub(/a/,\"b\")' ~/.hermes/cron/approved_scripts.json")
+        assert dangerous is True
+
+    def test_staging_dir_not_blocked(self):
+        # Only approved/ is the security boundary; staging writes must NOT be gated.
+        dangerous, key, desc = detect_dangerous_command(
+            "echo 'print(1)' > ~/.hermes/scripts/staging/foo.py")
+        assert dangerous is False
+
 
 class TestFindExecFullPathRm:
     """Detect find -exec with full-path rm bypasses."""
