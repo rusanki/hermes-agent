@@ -21,6 +21,7 @@ from agent.claude_cli_client import (
     ClaudeCliQuotaError,
     ClaudeCliAuthError,
     ClaudeCliError,
+    TOOL_MARKUP_INSTRUCTION,
 )
 
 
@@ -1302,6 +1303,19 @@ class MaxTokensFinishReasonTests(unittest.TestCase):
             messages=[{"role": "user", "content": "hi"}],
         )
         self.assertEqual(resp.choices[0].finish_reason, "stop")
+
+
+class ToolMarkupInstructionTests(unittest.TestCase):
+    """TOOL_MARKUP_INSTRUCTION must forbid narrating an action instead of
+    emitting the <tool_call> that actually performs it — the failure mode
+    this text-markup regime is prone to (model says "I've created the file"
+    with no tool call ever executed)."""
+
+    def test_forbids_claiming_unexecuted_actions(self):
+        self.assertIn("Saying you did something does not do it", TOOL_MARKUP_INSTRUCTION)
+
+    def test_no_longer_contains_old_plain_text_bullet(self):
+        self.assertNotIn("just answer the user normally", TOOL_MARKUP_INSTRUCTION)
 
 
 if __name__ == "__main__":

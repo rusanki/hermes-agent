@@ -749,7 +749,11 @@ TOOL_MARKUP_INSTRUCTION = (
     "- Do NOT apologize for lacking tools and do NOT claim you cannot perform an "
     "action — instead emit the appropriate <tool_call> and let Hermes execute "
     "it.\n"
-    "- If no tool is needed, just answer the user normally with plain text."
+    "- If (and only if) no action is needed, answer the user in plain text.\n"
+    "- NEVER state or imply that you have performed an action (created, wrote, "
+    "ran, fixed, scheduled, installed...) unless that action's <tool_call> was "
+    "already executed and its <tool_response> is visible in the transcript. "
+    "Saying you did something does not do it — emit the <tool_call>."
 )
 
 
