@@ -185,3 +185,10 @@ def test_show_staged_missing_raises(reg_env):
     import cron.script_registry as sr
     with pytest.raises(ValueError):
         sr.show_staged("nope.py")
+
+
+def test_is_approved_fail_closed_on_bad_type(reg_env):
+    # Any error (e.g. a non-path type) must fail closed to False, never raise.
+    import cron.script_registry as sr
+    assert sr.is_approved(None) is False
+    assert sr.is_approved(12345) is False

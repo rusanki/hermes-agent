@@ -168,12 +168,21 @@ def is_approved(script_path: str) -> bool:
         if not rec:
             return False
         return sha256_of(path.read_bytes()) == rec.get("sha256")
-    except (OSError, ValueError):
+    except Exception:
+        # Fail-closed on ANY error (bad type, resolve failure, unreadable file):
+        # this is a security gate, so ambiguity must never read as "approved".
         return False
 
 
 def revoke_script(name: str, revoked_by: str, delete_file: bool = True) -> dict:
-    """Remove the pin (and optionally the approved file)."""
+    """Remove the pin (and optionally the approved file).
+
+    Revocation deletes the pin outright, so there is no record to attach
+    ``revoked_by`` to here; the actor is recorded by the tool/hook audit layer,
+    not this pure module. The parameter is kept so the tool wrapper can pass the
+    verified uid for that audit line. Registry writes assume a single writer
+    (the pod's single scheduler/gateway process); no cross-process lock.
+    """
     safe = _validate_name(name, _approved_dir())
     reg = _read_json(_approved_registry_path())
     existed = reg.pop(safe, None) is not None
