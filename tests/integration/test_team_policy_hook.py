@@ -135,3 +135,75 @@ def test_explicit_deny_still_blocks_before_limit(tmp_path, monkeypatch):
     m=_load(); _setup(m,tmp_path,monkeypatch,pol)
     p={"tool_name":"terminal","session_id":"s1","extra":{"user_id":"U1"}}
     assert m.handle(p)["action"]=="block"
+
+# --- Action-aware creation gate (Task 6) -------------------------------------
+GATE_POLICY = {"version": 1, "default_role": "member",
+  "roles": {
+    "superadmin": {"allow": ["*"], "deny": []},
+    "admin": {"allow": ["*"], "deny": ["terminal", "execute_code", "write_file", "patch"]},
+    "member": {"allow": ["*"], "deny": ["terminal", "execute_code", "write_file", "patch"]},
+    "system": {"allow": ["read_file", "memory", "cronjob"], "deny": ["*"]},
+  },
+  "users": {
+    "U_SUPER": {"role": "superadmin"},
+    "U_ADMIN": {"role": "admin"},
+    "U_MEMBER": {"role": "member"},
+  }}
+
+def _gate_handle(m, tool, action, uid, tmp_path, monkeypatch):
+    monkeypatch.setattr(m, "_load_policy", lambda: GATE_POLICY)
+    monkeypatch.setattr(m, "AUDIT_PATH", str(tmp_path / "audit.log"))
+    payload = {"tool_name": tool, "session_id": "s", "extra": {"user_id": uid}}
+    if action is not None:
+        payload["tool_input"] = {"action": action}
+    return m.handle(payload)
+
+def test_gate_member_cronjob_create_blocked(tmp_path, monkeypatch):
+    out = _gate_handle(_load(), "cronjob", "create", "U_MEMBER", tmp_path, monkeypatch)
+    assert out.get("action") == "block"
+
+def test_gate_admin_cronjob_create_allowed(tmp_path, monkeypatch):
+    out = _gate_handle(_load(), "cronjob", "create", "U_ADMIN", tmp_path, monkeypatch)
+    assert not out
+
+def test_gate_member_cronjob_list_allowed(tmp_path, monkeypatch):
+    out = _gate_handle(_load(), "cronjob", "list", "U_MEMBER", tmp_path, monkeypatch)
+    assert not out
+
+def test_gate_member_cronjob_delete_blocked(tmp_path, monkeypatch):
+    out = _gate_handle(_load(), "cronjob", "delete", "U_MEMBER", tmp_path, monkeypatch)
+    assert out.get("action") == "block"
+
+def test_gate_member_cron_script_stage_blocked(tmp_path, monkeypatch):
+    out = _gate_handle(_load(), "cron_script", "stage", "U_MEMBER", tmp_path, monkeypatch)
+    assert out.get("action") == "block"
+
+def test_gate_admin_cron_script_stage_allowed(tmp_path, monkeypatch):
+    out = _gate_handle(_load(), "cron_script", "stage", "U_ADMIN", tmp_path, monkeypatch)
+    assert not out
+
+def test_gate_member_cron_script_show_allowed(tmp_path, monkeypatch):
+    # show/list_pending are not gated (read-only review)
+    out = _gate_handle(_load(), "cron_script", "show", "U_MEMBER", tmp_path, monkeypatch)
+    assert not out
+
+def test_gate_admin_cron_script_approve_blocked(tmp_path, monkeypatch):
+    out = _gate_handle(_load(), "cron_script_approve", "approve", "U_ADMIN", tmp_path, monkeypatch)
+    assert out.get("action") == "block"
+
+def test_gate_superadmin_cron_script_approve_allowed(tmp_path, monkeypatch):
+    out = _gate_handle(_load(), "cron_script_approve", "approve", "U_SUPER", tmp_path, monkeypatch)
+    assert not out
+
+def test_gate_approve_missing_action_still_superadmin_only(tmp_path, monkeypatch):
+    # Even without tool_input.action, the approve tool requires superadmin (fail-safe).
+    out = _gate_handle(_load(), "cron_script_approve", None, "U_ADMIN", tmp_path, monkeypatch)
+    assert out.get("action") == "block"
+
+def test_gate_decide_is_action_aware_directly(tmp_path, monkeypatch):
+    m = _load()
+    # decide() must accept the action arg and block member create
+    assert m.decide(GATE_POLICY, "U_MEMBER", "cronjob", "create")["action"] == "block"
+    assert m.decide(GATE_POLICY, "U_ADMIN", "cronjob", "create") is None
+    # backward-compat: decide() still works WITHOUT the action arg (defaults None)
+    assert m.decide(GATE_POLICY, "U_MEMBER", "read_file") is None

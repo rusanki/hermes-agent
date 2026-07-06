@@ -19,8 +19,30 @@ def _role_for(policy, user_id):
     u = (policy.get("users") or {}).get(user_id or "")
     return (u or {}).get("role") or policy.get("default_role") or "member"
 
-def decide(policy, user_id, tool_name):
+_CRONJOB_MUTATING_ACTIONS = {"create", "add", "edit", "delete", "remove", "rm"}
+_ROLE_RANK = {"viewer": 0, "member": 1, "system": 1, "admin": 2, "superadmin": 3}
+
+def _required_role(tool_name, action):
+    """Minimum role for an elevated (tool, action), or None if not gated here."""
+    a = (action or "").strip().lower()
+    if tool_name == "cron_script_approve":
+        return "superadmin"                 # tool-level: any/no action needs superadmin
+    if tool_name == "cron_script" and a == "stage":
+        return "admin"
+    if tool_name == "cronjob" and a in _CRONJOB_MUTATING_ACTIONS:
+        return "admin"
+    return None
+
+def _role_meets(role, required):
+    return _ROLE_RANK.get(role, 0) >= _ROLE_RANK.get(required, 99)
+
+def decide(policy, user_id, tool_name, action=None):
     """Return a block dict {"action":"block","message":...}, or None to allow.
+
+    An action-aware creation gate runs FIRST: for elevated (tool, action) pairs
+    (cron creation/edit, script staging/approval) the caller's role must meet a
+    minimum rank, else BLOCK. The gate only ADDS constraints -- it can block or
+    fall through, never grant. Then the existing allow/deny precedence applies:
 
     Precedence (first match wins):
       1. explicit deny  (tool_name in role.deny)   -> BLOCK
@@ -30,6 +52,11 @@ def decide(policy, user_id, tool_name):
       5. otherwise (allowlist miss)                -> BLOCK
     """
     role = _role_for(policy, user_id)
+    required = _required_role(tool_name, action)
+    if required is not None and not _role_meets(role, required):
+        return {"action": "block",
+                "message": (f"Your role '{role}' cannot perform '{tool_name}' "
+                            f"action '{action}' (requires {required}).")}
     rules = (policy.get("roles") or {}).get(role) or {}
     deny, allow = rules.get("deny") or [], rules.get("allow") or []
     block = {"action": "block",
@@ -124,6 +151,10 @@ def _audit(user_id, tool_name, decision, reason=""):
 def handle(payload):
     user_id = (payload.get("extra") or {}).get("user_id", "")
     tool_name = payload.get("tool_name", "")
+    # The action lives in tool_input (the shell-hook serializer maps tool args ->
+    # tool_input); the creation gate in decide() needs it to distinguish e.g.
+    # `cronjob list` (allowed) from `cronjob create` (elevated).
+    action = (payload.get("tool_input") or {}).get("action")
     # session_id is TOP-LEVEL (used by the limit task); read it now for forward-compat.
     session_id = payload.get("session_id", "")  # noqa: F841 (used by a later task)
     try:
@@ -134,7 +165,7 @@ def handle(payload):
         _audit(user_id, tool_name, None, reason="policy_load_error")
         print(f"team_policy: policy load failed ({e}); failing open (allowing)", file=sys.stderr)
         return {}
-    decision = decide(policy, user_id, tool_name)
+    decision = decide(policy, user_id, tool_name, action)
     if decision:
         # Blocked by role allow/deny — it never ran, so no need to count.
         _audit(user_id, tool_name, decision)
