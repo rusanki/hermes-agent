@@ -19,12 +19,23 @@ def _role_for(policy, user_id):
     u = (policy.get("users") or {}).get(user_id or "")
     return (u or {}).get("role") or policy.get("default_role") or "member"
 
-_CRONJOB_MUTATING_ACTIONS = {"create", "add", "edit", "delete", "remove", "rm"}
+# The REAL mutating cronjob actions are create/update/remove (verified in
+# tools/cronjob_tools.py): `update` is the EDIT verb (rewrites an existing
+# job's script/prompt), `remove` is delete. The add/edit/delete/rm aliases are
+# harmless extra coverage in case the serializer ever emits a synonym.
+_CRONJOB_MUTATING_ACTIONS = {"create", "add", "update", "edit", "delete", "remove", "rm"}
+# member and system are BOTH rank 1 (deliberate: both sit below admin). system
+# is a distinct role name so cron/scheduled runs get their own allow/deny list,
+# but it must NOT outrank admin for the creation gate.
 _ROLE_RANK = {"viewer": 0, "member": 1, "system": 1, "admin": 2, "superadmin": 3}
 
 def _required_role(tool_name, action):
     """Minimum role for an elevated (tool, action), or None if not gated here."""
-    a = (action or "").strip().lower()
+    # A non-string action (dict/list/int) must not raise here: normalize it to
+    # "" so it reads as "not a named mutating action" for cronjob/cron_script
+    # (falls through to normal allow/deny). cron_script_approve is gated at the
+    # tool level below, so its superadmin requirement is unaffected by action.
+    a = (action if isinstance(action, str) else "").strip().lower()
     if tool_name == "cron_script_approve":
         return "superadmin"                 # tool-level: any/no action needs superadmin
     if tool_name == "cron_script" and a == "stage":
@@ -154,6 +165,12 @@ def handle(payload):
     # The action lives in tool_input (the shell-hook serializer maps tool args ->
     # tool_input); the creation gate in decide() needs it to distinguish e.g.
     # `cronjob list` (allowed) from `cronjob create` (elevated).
+    #
+    # A missing/non-string action fails OPEN for cronjob/cron_script (they fall
+    # through to normal allow/deny) -- acceptable because the live serializer
+    # always sends a string action, and a malformed one is not a valid mutating
+    # verb. cron_script_approve is gated at the TOOL level (action ignored), so
+    # it fails CLOSED regardless of the action's type.
     action = (payload.get("tool_input") or {}).get("action")
     # session_id is TOP-LEVEL (used by the limit task); read it now for forward-compat.
     session_id = payload.get("session_id", "")  # noqa: F841 (used by a later task)
@@ -165,10 +182,29 @@ def handle(payload):
         _audit(user_id, tool_name, None, reason="policy_load_error")
         print(f"team_policy: policy load failed ({e}); failing open (allowing)", file=sys.stderr)
         return {}
-    decision = decide(policy, user_id, tool_name, action)
+    try:
+        decision = decide(policy, user_id, tool_name, action)
+    except Exception as e:
+        # A crash in the decision path must NOT fail OPEN for a gated tool --
+        # that would defeat the RBAC gate. Fail CLOSED for gated tools; for
+        # everything else preserve the availability-first ethos (fail open).
+        if _required_role(tool_name, action if isinstance(action, str) else None) is not None:
+            block = {"action": "block",
+                     "message": "Policy decision failed; blocking a privileged action (fail-closed)."}
+            _audit(user_id, tool_name, block, reason="decide_error")
+            return block
+        _audit(user_id, tool_name, None, reason="decide_error")
+        print(f"team_policy: decide failed ({e}); failing open for non-gated tool", file=sys.stderr)
+        return {}
     if decision:
         # Blocked by role allow/deny — it never ran, so no need to count.
-        _audit(user_id, tool_name, decision)
+        # Distinguish RBAC-gate blocks (role doesn't meet the required rank for
+        # an elevated action) so they're greppable in the audit log.
+        required = _required_role(tool_name, action)
+        if required is not None and not _role_meets(_role_for(policy, user_id), required):
+            _audit(user_id, tool_name, decision, reason="rbac_gate")
+        else:
+            _audit(user_id, tool_name, decision)
         return decision
     # Allowed by role. Enforce the per-session mutating cap (if any) on top.
     if tool_name in _MUTATING:

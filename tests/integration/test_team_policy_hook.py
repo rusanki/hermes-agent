@@ -207,3 +207,44 @@ def test_gate_decide_is_action_aware_directly(tmp_path, monkeypatch):
     assert m.decide(GATE_POLICY, "U_ADMIN", "cronjob", "create") is None
     # backward-compat: decide() still works WITHOUT the action arg (defaults None)
     assert m.decide(GATE_POLICY, "U_MEMBER", "read_file") is None
+
+# --- MUST-FIX 1: gate the REAL cron mutating verbs (create/update/remove) -----
+# The live cronjob tool's mutating actions are create/update/remove (verified in
+# tools/cronjob_tools.py). `update` is the EDIT verb -- a member calling
+# cronjob(action="update", ...) can rewrite an existing job's script, so it MUST
+# be gated. The earlier set used placeholder edit/delete and MISSED update.
+def test_gate_member_cronjob_update_blocked(tmp_path, monkeypatch):
+    out = _gate_handle(_load(), "cronjob", "update", "U_MEMBER", tmp_path, monkeypatch)
+    assert out.get("action") == "block"
+
+def test_gate_member_cronjob_remove_blocked(tmp_path, monkeypatch):
+    out = _gate_handle(_load(), "cronjob", "remove", "U_MEMBER", tmp_path, monkeypatch)
+    assert out.get("action") == "block"
+
+def test_gate_admin_cronjob_update_allowed(tmp_path, monkeypatch):
+    out = _gate_handle(_load(), "cronjob", "update", "U_ADMIN", tmp_path, monkeypatch)
+    assert not out
+
+# --- MUST-FIX 2: a non-string action must NOT crash the hook (fail-OPEN=bypass) -
+# A dict/list/int action would raise AttributeError in _required_role. Because
+# the hook's caller treats a crashed hook as NO BLOCK, that fails OPEN and
+# bypasses the gate. The hook must return a dict and never raise.
+def test_gate_nonstring_action_dict_does_not_crash(tmp_path, monkeypatch):
+    out = _gate_handle(_load(), "cronjob", {"nested": 1}, "U_MEMBER", tmp_path, monkeypatch)
+    assert isinstance(out, dict)   # returned a decision, did not raise
+
+def test_gate_nonstring_action_int_does_not_crash(tmp_path, monkeypatch):
+    out = _gate_handle(_load(), "cronjob", 5, "U_MEMBER", tmp_path, monkeypatch)
+    assert isinstance(out, dict)   # returned a decision, did not raise
+
+def test_gate_approve_nonstring_action_still_blocked_for_admin(tmp_path, monkeypatch):
+    # cron_script_approve is gated at the TOOL level (action ignored), so a
+    # non-string action must NOT let a non-superadmin through.
+    out = _gate_handle(_load(), "cron_script_approve", {"x": 1}, "U_ADMIN", tmp_path, monkeypatch)
+    assert out.get("action") == "block"
+
+# --- MINOR 1: gate blocks are audited with reason="rbac_gate" (greppable) ------
+def test_gate_block_audited_with_rbac_gate_reason(tmp_path, monkeypatch):
+    audit = tmp_path / "audit.log"
+    _gate_handle(_load(), "cronjob", "create", "U_MEMBER", tmp_path, monkeypatch)
+    assert "rbac_gate" in audit.read_text()
