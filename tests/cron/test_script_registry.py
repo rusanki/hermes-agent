@@ -88,3 +88,100 @@ def test_restage_when_queue_full_still_allowed(reg_env):
     # s0.py already exists -> updating it is allowed even at capacity
     res = sr.stage_script("s0.py", "print('updated')\n", requested_by="U1")
     assert res["sha256"] == sr.sha256_of("print('updated')\n")
+
+
+def test_approve_pins_content_and_copies_to_approved(reg_env):
+    import cron.script_registry as sr
+    staged = sr.stage_script("f.py", "print('f')\n", requested_by="U1")
+    res = sr.approve_script("f.py", staged["sha256"], approver_uid="U_SUPER")
+    assert res["approved"] is True
+    approved_file = reg_env / "scripts" / "approved" / "f.py"
+    assert approved_file.read_text() == "print('f')\n"
+    reg = sr._read_json(sr._approved_registry_path())
+    assert reg["f.py"]["sha256"] == staged["sha256"]
+    assert reg["f.py"]["approved_by"] == "U_SUPER"
+    assert "approved_at" in reg["f.py"]
+
+
+def test_approve_clears_pending_record(reg_env):
+    import cron.script_registry as sr
+    staged = sr.stage_script("f.py", "print('f')\n", requested_by="U1")
+    sr.approve_script("f.py", staged["sha256"], approver_uid="U_SUPER")
+    assert all(p["name"] != "f.py" for p in sr.list_pending())
+
+
+def test_approve_rejects_stale_sha(reg_env):
+    import cron.script_registry as sr
+    sr.stage_script("f.py", "print('f')\n", requested_by="U1")
+    with pytest.raises(ValueError):
+        sr.approve_script("f.py", "deadbeef", approver_uid="U_SUPER")
+
+
+def test_approve_rehashes_staging_file_not_pending_record(reg_env):
+    # TOCTOU: staging file changed between stage and approve -> reject even if
+    # the caller passes the ORIGINAL sha (pin must re-hash the file on disk).
+    import cron.script_registry as sr
+    staged = sr.stage_script("f.py", "print('orig')\n", requested_by="U1")
+    (reg_env / "scripts" / "staging" / "f.py").write_text("print('EVIL')\n")
+    with pytest.raises(ValueError):
+        sr.approve_script("f.py", staged["sha256"], approver_uid="U_SUPER")
+
+
+def test_approve_missing_staged_raises(reg_env):
+    import cron.script_registry as sr
+    with pytest.raises(ValueError):
+        sr.approve_script("nope.py", "abc", approver_uid="U_SUPER")
+
+
+def test_is_approved_true_only_on_matching_hash(reg_env):
+    import cron.script_registry as sr
+    sr.stage_script("f.py", "print('f')\n", requested_by="U1")
+    sr.approve_script("f.py", sr.sha256_of("print('f')\n"), approver_uid="U_SUPER")
+    approved_file = reg_env / "scripts" / "approved" / "f.py"
+    assert sr.is_approved(str(approved_file)) is True
+    approved_file.write_text("print('tampered')\n")
+    assert sr.is_approved(str(approved_file)) is False
+
+
+def test_is_approved_false_for_unknown_or_missing(reg_env):
+    import cron.script_registry as sr
+    assert sr.is_approved(str(reg_env / "scripts" / "approved" / "nope.py")) is False
+
+
+def test_is_approved_false_for_path_outside_approved_dir(reg_env):
+    # A path that resolves outside approved/ must never be considered approved.
+    import cron.script_registry as sr
+    outside = reg_env / "scripts" / "staging" / "f.py"
+    outside.write_text("print('x')\n")
+    assert sr.is_approved(str(outside)) is False
+
+
+def test_revoke_removes_pin(reg_env):
+    import cron.script_registry as sr
+    sr.stage_script("f.py", "print('f')\n", requested_by="U1")
+    sr.approve_script("f.py", sr.sha256_of("print('f')\n"), approver_uid="U_SUPER")
+    approved_file = reg_env / "scripts" / "approved" / "f.py"
+    assert sr.is_approved(str(approved_file)) is True
+    out = sr.revoke_script("f.py", revoked_by="U_SUPER")
+    assert out["revoked"] is True
+    assert sr.is_approved(str(approved_file)) is False
+
+
+def test_revoke_unknown_reports_false(reg_env):
+    import cron.script_registry as sr
+    out = sr.revoke_script("never.py", revoked_by="U_SUPER")
+    assert out["revoked"] is False
+
+
+def test_show_staged_returns_full_content_and_sha(reg_env):
+    import cron.script_registry as sr
+    sr.stage_script("f.py", "print('full body here')\n", requested_by="U1")
+    shown = sr.show_staged("f.py")
+    assert shown["content"] == "print('full body here')\n"
+    assert shown["sha256"] == sr.sha256_of("print('full body here')\n")
+
+
+def test_show_staged_missing_raises(reg_env):
+    import cron.script_registry as sr
+    with pytest.raises(ValueError):
+        sr.show_staged("nope.py")

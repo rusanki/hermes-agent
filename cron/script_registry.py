@@ -11,7 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Optional, Union
+from typing import Union
 
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
@@ -116,3 +116,71 @@ def stage_script(name: str, content: str, requested_by: str) -> dict:
 def list_pending() -> list:
     pending = _read_json(_pending_path())
     return [{"name": n, **rec} for n, rec in sorted(pending.items())]
+
+
+def show_staged(name: str) -> dict:
+    """Full on-disk staged content + sha for approver review. Raises if absent."""
+    safe = _validate_name(name, _staging_dir())
+    path = _staging_dir() / safe
+    if not path.is_file():
+        raise ValueError(f"no staged script named {name!r}")
+    content = path.read_text(encoding="utf-8")
+    return {"name": safe, "content": content, "sha256": sha256_of(content)}
+
+
+def approve_script(name: str, expected_sha256: str, approver_uid: str) -> dict:
+    """Re-hash the staging file (TOCTOU guard), copy to approved, write pin."""
+    safe = _validate_name(name, _staging_dir())
+    staging_path = _staging_dir() / safe
+    if not staging_path.is_file():
+        raise ValueError(f"no staged script named {name!r}")
+    actual = sha256_of(staging_path.read_bytes())
+    if actual != (expected_sha256 or ""):
+        raise ValueError("content changed since staging, re-review (sha mismatch)")
+    (_approved_dir() / safe).write_bytes(staging_path.read_bytes())
+    ts = _hermes_now()
+    reg = _read_json(_approved_registry_path())
+    reg[safe] = {
+        "sha256": actual,
+        "approved_by": approver_uid or "",
+        "approved_at": ts.isoformat(),
+        "source_staging": str(staging_path),
+    }
+    _write_json(_approved_registry_path(), reg)
+    pending = _read_json(_pending_path())
+    pending.pop(safe, None)
+    _write_json(_pending_path(), pending)
+    return {"approved": True, "name": safe, "sha256": actual}
+
+
+def is_approved(script_path: str) -> bool:
+    """Fail-closed: True only if the resolved file is inside approved/, its name
+    is pinned, and its current content re-hashes to the pin."""
+    try:
+        approved_dir = _approved_dir()
+        raw = Path(script_path).expanduser()
+        path = raw.resolve() if raw.is_absolute() else (approved_dir / raw).resolve()
+        if validate_within_dir(path, approved_dir) is not None:
+            return False
+        if not path.is_file():
+            return False
+        rec = _read_json(_approved_registry_path()).get(path.name)
+        if not rec:
+            return False
+        return sha256_of(path.read_bytes()) == rec.get("sha256")
+    except (OSError, ValueError):
+        return False
+
+
+def revoke_script(name: str, revoked_by: str, delete_file: bool = True) -> dict:
+    """Remove the pin (and optionally the approved file)."""
+    safe = _validate_name(name, _approved_dir())
+    reg = _read_json(_approved_registry_path())
+    existed = reg.pop(safe, None) is not None
+    _write_json(_approved_registry_path(), reg)
+    if delete_file:
+        try:
+            (_approved_dir() / safe).unlink()
+        except FileNotFoundError:
+            pass
+    return {"revoked": existed, "name": safe}
