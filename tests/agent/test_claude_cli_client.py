@@ -6,6 +6,7 @@ import json
 import os as _os
 import subprocess
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from agent.claude_cli_client import (
     ClaudeCliClient,
@@ -16,10 +17,21 @@ from agent.claude_cli_client import (
     _render_assistant_tool_calls,
     _render_tool_response,
     _parse_stream_json_lines,
+    _parse_checked,
     ClaudeCliQuotaError,
     ClaudeCliAuthError,
     ClaudeCliError,
+    TOOL_MARKUP_INSTRUCTION,
 )
+
+
+def _run(lines, returncode=0, stderr=""):
+    """Wrap fixture stdout lines into the ``_run_claude`` return shape.
+
+    ``_run_claude`` returns ``SimpleNamespace(lines=..., returncode=..., stderr=...)``
+    since Task 3; this mirrors that shape for mocks/fixtures across the test file.
+    """
+    return SimpleNamespace(lines=list(lines), returncode=returncode, stderr=stderr)
 
 
 class FormatterTests(unittest.TestCase):
@@ -59,15 +71,17 @@ class FormatterTests(unittest.TestCase):
 
     def test_extract_single_tool_call(self):
         text = '<tool_call>{"name": "read_file", "arguments": "{\\"path\\": \\"/x\\"}"}</tool_call>'
-        calls, cleaned = _extract_tool_calls_from_text(text)
+        calls, cleaned, malformed = _extract_tool_calls_from_text(text)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].function.name, "read_file")
         self.assertEqual(cleaned, "")
+        self.assertEqual(malformed, [])
 
     def test_extract_text_only_no_calls(self):
-        calls, cleaned = _extract_tool_calls_from_text("just text")
+        calls, cleaned, malformed = _extract_tool_calls_from_text("just text")
         self.assertEqual(calls, [])
         self.assertEqual(cleaned, "just text")
+        self.assertEqual(malformed, [])
 
     def test_render_extract_roundtrip(self):
         # An assistant tool_call (args as a JSON string) rendered into a prompt
@@ -77,7 +91,7 @@ class FormatterTests(unittest.TestCase):
             {"id": "c1", "type": "function",
              "function": {"name": "read_file", "arguments": '{"path":"/x"}'}}]}]
         prompt = _format_messages_as_prompt(msgs, model=None, tools=None)
-        calls, _ = _extract_tool_calls_from_text(prompt)
+        calls, _, _malformed = _extract_tool_calls_from_text(prompt)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].function.name, "read_file")
         self.assertEqual(json.loads(calls[0].function.arguments), {"path": "/x"})
@@ -108,14 +122,212 @@ class FormatterTests(unittest.TestCase):
         self.assertIn("<tool_call>", prompt)
         self.assertIn("read_file", prompt)
 
-    def test_malformed_tool_call_json_is_dropped_but_consumed(self):
-        # A malformed <tool_call> block yields zero calls, but the block is
-        # still stripped from the cleaned text while surrounding text survives.
+    def test_malformed_tool_call_json_is_reported_and_left_visible(self):
+        # A malformed <tool_call> block yields zero calls, is reported in
+        # `malformed` with an error string, and is NEVER deleted from the
+        # cleaned text — the raw block must stay visible (never silently
+        # discarded), while surrounding text also survives.
         text = "<tool_call>{not valid json}</tool_call> trailing"
-        calls, cleaned = _extract_tool_calls_from_text(text)
+        calls, cleaned, malformed = _extract_tool_calls_from_text(text)
         self.assertEqual(calls, [])
         self.assertIn("trailing", cleaned)
-        self.assertNotIn("not valid json", cleaned)
+        self.assertIn("not valid json", cleaned)
+        self.assertEqual(len(malformed), 1)
+        self.assertIn("not valid json", malformed[0]["raw"])
+        self.assertTrue(malformed[0]["error"])
+
+    def test_malformed_and_valid_blocks_in_same_text(self):
+        # A malformed block alongside a valid one: the valid block is still
+        # extracted and stripped from cleaned text, while the malformed block
+        # is reported AND stays visible in cleaned text.
+        text = (
+            "Before.\n"
+            "<tool_call>{not valid json}</tool_call>\n"
+            'adapter <tool_call>{"name": "read_file", "arguments": "{\\"path\\": \\"/x\\"}"}</tool_call>\n'
+            "After."
+        )
+        calls, cleaned, malformed = _extract_tool_calls_from_text(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].function.name, "read_file")
+        self.assertEqual(len(malformed), 1)
+        self.assertIn("not valid json", malformed[0]["raw"])
+        self.assertIn("not valid json", cleaned)
+        self.assertIn("Before.", cleaned)
+        self.assertIn("After.", cleaned)
+        # The valid block's markup must be gone; the malformed block's must
+        # remain (it is not consumed).
+        self.assertNotIn("read_file", cleaned)
+
+    def test_malformed_json_error_string_is_descriptive(self):
+        # The error string must describe the JSON failure, not be empty/generic.
+        text = "<tool_call>{not valid json}</tool_call>"
+        _, _, malformed = _extract_tool_calls_from_text(text)
+        self.assertEqual(len(malformed), 1)
+        self.assertIsInstance(malformed[0]["error"], str)
+        self.assertGreater(len(malformed[0]["error"]), 0)
+
+    def test_malformed_non_dict_json_result_reported(self):
+        # Valid JSON that parses to a non-dict (e.g. a bare list) must be
+        # reported as malformed, not silently ignored.
+        text = "<tool_call>[1, 2, 3]</tool_call>"
+        calls, cleaned, malformed = _extract_tool_calls_from_text(text)
+        self.assertEqual(calls, [])
+        self.assertEqual(len(malformed), 1)
+        self.assertIn("[1, 2, 3]", cleaned)
+
+    def test_malformed_missing_name_reported(self):
+        # Valid JSON dict but missing/blank "name" must be reported as
+        # malformed and left visible.
+        text = '<tool_call>{"arguments": "{}"}</tool_call>'
+        calls, cleaned, malformed = _extract_tool_calls_from_text(text)
+        self.assertEqual(calls, [])
+        self.assertEqual(len(malformed), 1)
+        self.assertIn("arguments", cleaned)
+
+    def test_malformed_blank_name_reported(self):
+        text = '<tool_call>{"name": "  ", "arguments": "{}"}</tool_call>'
+        calls, cleaned, malformed = _extract_tool_calls_from_text(text)
+        self.assertEqual(calls, [])
+        self.assertEqual(len(malformed), 1)
+
+    def test_malformed_literal_control_char_in_json_string(self):
+        # A literal newline (raw control char, not the two-char escape "\n")
+        # embedded in a JSON string value: json.loads must reject this, and it
+        # must be reported as malformed rather than silently dropped.
+        text = '<tool_call>{"name": "write_file", "arguments": "{\\"content\\": \\"line1\nline2\\"}"}</tool_call>'
+        calls, cleaned, malformed = _extract_tool_calls_from_text(text)
+        self.assertEqual(calls, [])
+        self.assertEqual(len(malformed), 1)
+        self.assertIn("write_file", cleaned)
+
+    def test_unclosed_tool_call_tag_detected(self):
+        # Output truncated mid-block (max_tokens/timeout): an opening
+        # <tool_call> with no matching closing tag must be reported as
+        # malformed with a specific error, and left visible (not consumed).
+        text = 'Sure, one sec.\n<tool_call>{"name": "cronjob", "argu'
+        calls, cleaned, malformed = _extract_tool_calls_from_text(text)
+        self.assertEqual(calls, [])
+        self.assertEqual(len(malformed), 1)
+        self.assertEqual(malformed[0]["error"], "unclosed <tool_call> tag")
+        self.assertIn("cronjob", malformed[0]["raw"])
+        self.assertIn("Sure, one sec.", cleaned)
+        self.assertIn("<tool_call>", cleaned)
+
+    def test_unclosed_tag_raw_capped_at_500_chars(self):
+        text = "<tool_call>" + ("x" * 1000)
+        _, _, malformed = _extract_tool_calls_from_text(text)
+        self.assertEqual(len(malformed), 1)
+        self.assertLessEqual(len(malformed[0]["raw"]), 500)
+
+    def test_malformed_block_raw_capped_at_500_chars(self):
+        # A malformed (parse-failing) block's raw text is capped at 500 chars.
+        text = "<tool_call>{not valid json " + ("x" * 1000) + "}</tool_call>"
+        _, _, malformed = _extract_tool_calls_from_text(text)
+        self.assertEqual(len(malformed), 1)
+        self.assertLessEqual(len(malformed[0]["raw"]), 500)
+
+    def test_no_unclosed_tag_false_positive_when_all_blocks_closed(self):
+        # A normal closed block must NOT trigger unclosed-tag detection.
+        text = '<tool_call>{"name": "read_file", "arguments": "{}"}</tool_call>'
+        _, _, malformed = _extract_tool_calls_from_text(text)
+        self.assertEqual(malformed, [])
+
+    def test_extract_tool_call_with_nested_brace_arguments_object(self):
+        # Regression guard: full nested-brace payloads must extract intact
+        # under the widened `(.*?)` capture. The old `(\{.*?\})` also handled
+        # these via backtracking; the real motivation for the widened capture
+        # is that non-`{`-starting/garbled payloads now match and can be
+        # routed to malformed handling (Task 2) instead of shipping as raw
+        # unmatched text.
+        text = (
+            '<tool_call>{"name":"cronjob","arguments":{"action":"create",'
+            '"job":{"schedule":"0 9 * * *","name":"digest"}}}</tool_call>'
+        )
+        calls, cleaned, malformed = _extract_tool_calls_from_text(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].function.name, "cronjob")
+        # function.arguments is stringified in `_try_add_tool_call` since the
+        # parsed "arguments" value here is an object, not already a string.
+        self.assertEqual(
+            json.loads(calls[0].function.arguments),
+            {"action": "create", "job": {"schedule": "0 9 * * *", "name": "digest"}},
+        )
+        self.assertEqual(cleaned, "")
+        self.assertEqual(malformed, [])
+
+    def test_extract_tool_call_with_escaped_braces_in_argument_string(self):
+        # "arguments" as a JSON string whose contents themselves contain
+        # braces/quotes (escaped) must not confuse the block extraction.
+        text = (
+            '<tool_call>{"name": "write_file", '
+            '"arguments": "{\\"path\\": \\"/tmp/x\\", '
+            '\\"content\\": \\"if (a) { b(); }\\"}"}</tool_call>'
+        )
+        calls, cleaned, malformed = _extract_tool_calls_from_text(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].function.name, "write_file")
+        self.assertEqual(
+            json.loads(calls[0].function.arguments),
+            {"path": "/tmp/x", "content": "if (a) { b(); }"},
+        )
+        self.assertEqual(cleaned, "")
+        self.assertEqual(malformed, [])
+
+    def test_extract_pretty_printed_multiline_tool_call(self):
+        # Pretty-printed JSON (newlines/indentation, nested object) inside the
+        # block must still be captured in full.
+        text = (
+            "<tool_call>\n"
+            "{\n"
+            '  "name": "cronjob",\n'
+            '  "arguments": {\n'
+            '    "action": "create",\n'
+            '    "job": {\n'
+            '      "schedule": "0 9 * * *"\n'
+            "    }\n"
+            "  }\n"
+            "}\n"
+            "</tool_call>"
+        )
+        calls, cleaned, malformed = _extract_tool_calls_from_text(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].function.name, "cronjob")
+        self.assertEqual(
+            json.loads(calls[0].function.arguments),
+            {"action": "create", "job": {"schedule": "0 9 * * *"}},
+        )
+        self.assertEqual(cleaned, "")
+        self.assertEqual(malformed, [])
+
+    def test_two_nested_brace_tool_calls_with_surrounding_prose(self):
+        # Two nested-brace blocks in one message, with prose before/between/
+        # after: both must be extracted in order, and the cleaned text must
+        # retain the prose but no <tool_call> markup.
+        text = (
+            "Sure, I'll do both.\n"
+            '<tool_call>{"name":"cronjob","arguments":{"action":"create",'
+            '"job":{"schedule":"0 9 * * *"}}}</tool_call>\n'
+            "Now the second one.\n"
+            '<tool_call>{"name":"cronjob","arguments":{"action":"delete",'
+            '"job":{"id":"abc"}}}</tool_call>\n'
+            "Done."
+        )
+        calls, cleaned, malformed = _extract_tool_calls_from_text(text)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0].function.name, "cronjob")
+        self.assertEqual(calls[1].function.name, "cronjob")
+        self.assertEqual(malformed, [])
+        self.assertEqual(
+            json.loads(calls[0].function.arguments)["action"], "create"
+        )
+        self.assertEqual(
+            json.loads(calls[1].function.arguments)["action"], "delete"
+        )
+        self.assertIn("Sure, I'll do both.", cleaned)
+        self.assertIn("Now the second one.", cleaned)
+        self.assertIn("Done.", cleaned)
+        self.assertNotIn("<tool_call>", cleaned)
+        self.assertNotIn("</tool_call>", cleaned)
 
     def test_tool_message_with_json_string_content(self):
         # A tool message whose content is a JSON string round-trips as a parsed
@@ -247,7 +459,7 @@ class StreamParserTests(unittest.TestCase):
 class ClientFacadeTests(unittest.TestCase):
     def _client_with_output(self, lines):
         client = ClaudeCliClient(model="claude-opus-4-8")
-        client._run_claude = lambda prompt, system_prompt, model, timeout, image_dir=None: list(lines)
+        client._run_claude = lambda prompt, system_prompt, model, timeout, image_dir=None: _run(lines)
         return client
 
     def test_text_response_shape(self):
@@ -319,6 +531,224 @@ class ClientFacadeTests(unittest.TestCase):
             self.assertIn("HOME", env)
 
 
+def _result_line(text, input_tokens=0, output_tokens=0, cache_read=0):
+    return json.dumps({
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "api_error_status": None,
+        "stop_reason": "end_turn",
+        "result": text,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_read_input_tokens": cache_read,
+        },
+        "total_cost_usd": 0.0,
+    })
+
+
+class RepairRetryTests(unittest.TestCase):
+    """Malformed <tool_call> blocks trigger exactly one repair retry attempt.
+
+    ``_run_claude`` is mocked with a side_effect list so each call in the
+    sequence returns fixture stream-json stdout lines; invocation count is
+    asserted directly on the mock.
+    """
+
+    def _client(self):
+        return ClaudeCliClient(model="claude-opus-4-8")
+
+    def test_malformed_only_then_valid_repair_uses_retry_result(self):
+        # A block with a literal (raw) newline control char inside a JSON
+        # string value: json.loads rejects this. No valid calls on the first
+        # attempt -> exactly one repair retry -> retry succeeds.
+        original_text = (
+            'Sure, I will do that now.\n'
+            '<tool_call>{"name": "write_file", "arguments": '
+            '"{\\"content\\": \\"line1\nline2\\"}"}</tool_call>'
+        )
+        retry_text = '<tool_call>{"name": "write_file", "arguments": "{\\"content\\": \\"line1 line2\\"}"}</tool_call>'
+        first_lines = [_result_line(original_text, input_tokens=10, output_tokens=20, cache_read=1)]
+        second_lines = [_result_line(retry_text, input_tokens=5, output_tokens=7, cache_read=2)]
+
+        client = self._client()
+        mock_run = MagicMock(side_effect=[_run(first_lines), _run(second_lines)])
+        client._run_claude = mock_run
+
+        with self.assertLogs("agent.claude_cli_client", level="INFO") as cm:
+            resp = client.chat.completions.create(
+                model="claude-opus-4-8",
+                messages=[{"role": "user", "content": "write something"}],
+            )
+
+        self.assertEqual(mock_run.call_count, 2)
+        # The second call's prompt must contain the original assistant text
+        # and the correction sentence.
+        second_call_prompt = mock_run.call_args_list[1].args[0]
+        self.assertIn("Sure, I will do that now.", second_call_prompt)
+        self.assertIn("malformed <tool_call>", second_call_prompt)
+        # Success is logged at INFO level.
+        self.assertIn("repair retry succeeded", "\n".join(cm.output))
+
+        self.assertEqual(resp.choices[0].finish_reason, "tool_calls")
+        self.assertEqual(resp.choices[0].message.tool_calls[0].function.name, "write_file")
+        # Usage tokens must be summed across both runs.
+        self.assertEqual(resp.usage.prompt_tokens, 15)
+        self.assertEqual(resp.usage.completion_tokens, 27)
+        self.assertEqual(resp.usage.prompt_tokens_details.cached_tokens, 3)
+
+    def test_malformed_only_retry_also_malformed_falls_back_to_original(self):
+        original_text = "I've made the change.\n<tool_call>{not valid json}</tool_call>"
+        retry_text = "Still broken.\n<tool_call>{also not valid}</tool_call>"
+        first_lines = [_result_line(original_text, input_tokens=10, output_tokens=20, cache_read=1)]
+        second_lines = [_result_line(retry_text, input_tokens=5, output_tokens=7, cache_read=2)]
+
+        client = self._client()
+        mock_run = MagicMock(side_effect=[_run(first_lines), _run(second_lines)])
+        client._run_claude = mock_run
+
+        with self.assertLogs("agent.claude_cli_client", level="WARNING") as cm:
+            resp = client.chat.completions.create(
+                model="claude-opus-4-8",
+                messages=[{"role": "user", "content": "do something"}],
+            )
+
+        self.assertEqual(mock_run.call_count, 2)
+        self.assertEqual(resp.choices[0].finish_reason, "stop")
+        # The RAW malformed block text from the ORIGINAL reply must be visible.
+        self.assertIn("not valid json", resp.choices[0].message.content)
+        self.assertFalse(resp.choices[0].message.tool_calls)
+        # Both the malformed-block warning and the repair-failed warning fire.
+        joined_logs = "\n".join(cm.output)
+        self.assertIn("malformed", joined_logs.lower())
+        self.assertIn("repair attempt failed", joined_logs.lower())
+        # Retry tokens are real cost: usage is summed even on a failed repair.
+        self.assertEqual(resp.usage.prompt_tokens, 15)
+        self.assertEqual(resp.usage.completion_tokens, 27)
+        self.assertEqual(resp.usage.prompt_tokens_details.cached_tokens, 3)
+
+    def test_repair_run_exception_falls_back_to_original(self):
+        # A repair run that raises (e.g. subprocess timeout) must never
+        # destroy the original result: no exception propagates, the original
+        # text (raw malformed block visible) is delivered, and the raised
+        # warning is logged.
+        original_text = "Done!\n<tool_call>{not valid json}</tool_call>"
+        first_lines = [_result_line(original_text, input_tokens=10, output_tokens=20)]
+
+        client = self._client()
+        mock_run = MagicMock(side_effect=[_run(first_lines), ClaudeCliError("timeout")])
+        client._run_claude = mock_run
+
+        with self.assertLogs("agent.claude_cli_client", level="WARNING") as cm:
+            resp = client.chat.completions.create(
+                model="claude-opus-4-8",
+                messages=[{"role": "user", "content": "do something"}],
+            )
+
+        self.assertEqual(mock_run.call_count, 2)
+        self.assertEqual(resp.choices[0].finish_reason, "stop")
+        self.assertIn("not valid json", resp.choices[0].message.content)
+        self.assertFalse(resp.choices[0].message.tool_calls)
+        # Only the original run's usage is counted (the raising run returned
+        # no parseable usage).
+        self.assertEqual(resp.usage.prompt_tokens, 10)
+        self.assertEqual(resp.usage.completion_tokens, 20)
+        joined_logs = "\n".join(cm.output)
+        self.assertIn("repair attempt raised", joined_logs)
+        # The exception class name must be included per the log-tweak.
+        self.assertIn("ClaudeCliError", joined_logs)
+        self.assertIn("timeout", joined_logs)
+
+    def test_image_turn_malformed_skips_repair(self):
+        # An image-bearing turn must NOT attempt repair: the image scratch dir
+        # is already cleaned up and the repair run has tools disabled, so the
+        # retry model would be told to Read a file it can't access. The
+        # original fallback is delivered after exactly one subprocess run.
+        original_text = "I see the image.\n<tool_call>{not valid json}</tool_call>"
+        first_lines = [_result_line(original_text)]
+
+        client = self._client()
+        mock_run = MagicMock(side_effect=[_run(first_lines)])
+        client._run_claude = mock_run
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe and act"},
+                    {"type": "image_url", "image_url": {"url": _PNG_1PX_DATA_URL}},
+                ],
+            }
+        ]
+        with self.assertLogs("agent.claude_cli_client", level="WARNING") as cm:
+            resp = client.chat.completions.create(
+                model="claude-opus-4-8", messages=messages,
+            )
+
+        self.assertEqual(mock_run.call_count, 1)
+        self.assertEqual(resp.choices[0].finish_reason, "stop")
+        self.assertIn("not valid json", resp.choices[0].message.content)
+        joined_logs = "\n".join(cm.output)
+        self.assertIn("skipping repair retry for image-bearing turn", joined_logs)
+
+    def test_malformed_and_valid_mixed_no_repair_run(self):
+        text = (
+            "Partial success.\n"
+            "<tool_call>{not valid json}</tool_call>\n"
+            '<tool_call>{"name": "read_file", "arguments": "{\\"path\\": \\"/x\\"}"}</tool_call>'
+        )
+        lines = [_result_line(text)]
+        client = self._client()
+        mock_run = MagicMock(side_effect=[_run(lines)])
+        client._run_claude = mock_run
+
+        with self.assertLogs("agent.claude_cli_client", level="WARNING"):
+            resp = client.chat.completions.create(
+                model="claude-opus-4-8",
+                messages=[{"role": "user", "content": "do two things"}],
+            )
+
+        self.assertEqual(mock_run.call_count, 1)
+        self.assertEqual(resp.choices[0].finish_reason, "tool_calls")
+        self.assertEqual(resp.choices[0].message.tool_calls[0].function.name, "read_file")
+        self.assertIn("not valid json", resp.choices[0].message.content)
+
+    def test_no_malformed_no_repair_run(self):
+        lines = [_result_line("just a normal reply", input_tokens=3, output_tokens=4)]
+        client = self._client()
+        mock_run = MagicMock(side_effect=[_run(lines)])
+        client._run_claude = mock_run
+
+        resp = client.chat.completions.create(
+            model="claude-opus-4-8",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+
+        self.assertEqual(mock_run.call_count, 1)
+        self.assertEqual(resp.choices[0].finish_reason, "stop")
+        self.assertEqual(resp.choices[0].message.content, "just a normal reply")
+
+    def test_unclosed_tag_triggers_repair(self):
+        original_text = 'One moment.\n<tool_call>{"name": "cronjob", "argu'
+        retry_text = '<tool_call>{"name": "cronjob", "arguments": "{\\"action\\": \\"list\\"}"}</tool_call>'
+        first_lines = [_result_line(original_text)]
+        second_lines = [_result_line(retry_text)]
+
+        client = self._client()
+        mock_run = MagicMock(side_effect=[_run(first_lines), _run(second_lines)])
+        client._run_claude = mock_run
+
+        resp = client.chat.completions.create(
+            model="claude-opus-4-8",
+            messages=[{"role": "user", "content": "list my jobs"}],
+        )
+
+        self.assertEqual(mock_run.call_count, 2)
+        self.assertEqual(resp.choices[0].finish_reason, "tool_calls")
+        self.assertEqual(resp.choices[0].message.tool_calls[0].function.name, "cronjob")
+
+
 class ClientAwaitableCreateTests(unittest.TestCase):
     """``chat.completions.create`` must work BOTH awaited and un-awaited.
 
@@ -334,7 +764,7 @@ class ClientAwaitableCreateTests(unittest.TestCase):
 
     def _client_with_output(self, lines):
         client = ClaudeCliClient(model="claude-opus-4-8")
-        client._run_claude = lambda prompt, system_prompt, model, timeout, image_dir=None: list(lines)
+        client._run_claude = lambda prompt, system_prompt, model, timeout, image_dir=None: _run(lines)
         return client
 
     _LINES = [
@@ -436,19 +866,49 @@ class RunClaudeSubprocessTests(unittest.TestCase):
                 client._run_claude("p", "sys", "claude-opus-4-8", 900.0)
         self.assertIn("boom", str(cm.exception))
 
-    def test_nonzero_returncode_with_parseable_stdout_returns_lines(self):
-        # rc != 0 but stdout carries a parseable success result line: _run_claude
-        # must NOT raise and must defer to the parser by returning the lines.
+    def test_nonzero_returncode_with_partial_stdout_no_result_event_raises(self):
+        # rc != 0 and stdout has SOME content but no terminal `result` event
+        # (e.g. an assistant-only partial line): _run_claude itself must NOT
+        # raise (its own guard only fires on EMPTY stdout) — it hands back the
+        # namespace, but `_parse_checked` must then raise on the missing
+        # terminal result event, per the new contract (Task 3).
+        client = self._client()
+        partial_line = json.dumps({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "partial"}], "usage": {}},
+        })
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = (partial_line + "\n", "some stderr")
+        mock_proc.returncode = 1
+        with patch("agent.claude_cli_client.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
+            run = client._run_claude("p", "sys", "claude-opus-4-8", 900.0)
+        self.assertEqual(run.lines, [partial_line])
+        self.assertEqual(run.returncode, 1)
+        with self.assertRaises(ClaudeCliError) as cm:
+            _parse_checked(run)
+        self.assertIn("no terminal result", str(cm.exception))
+        self.assertIn("exit=1", str(cm.exception))
+
+    def test_nonzero_returncode_with_complete_result_event_is_accepted(self):
+        # rc != 0 but stdout carries a COMPLETE terminal `result` event: this
+        # must be accepted (the parsed result is authoritative), with a
+        # warning logged noting the returncode/result-event discrepancy.
         client = self._client()
         mock_proc = MagicMock()
         mock_proc.communicate.return_value = (_SUCCESS_RESULT_LINE + "\n", "")
         mock_proc.returncode = 1
         with patch("agent.claude_cli_client.subprocess.Popen") as mock_popen:
             mock_popen.return_value = mock_proc
-            lines = client._run_claude("p", "sys", "claude-opus-4-8", 900.0)
-        self.assertEqual(lines, [_SUCCESS_RESULT_LINE])
-        # Parser later yields "ok" from these lines.
-        self.assertEqual(_parse_stream_json_lines(lines).text, "ok")
+            run = client._run_claude("p", "sys", "claude-opus-4-8", 900.0)
+        self.assertEqual(run.lines, [_SUCCESS_RESULT_LINE])
+        self.assertEqual(run.returncode, 1)
+        with self.assertLogs("agent.claude_cli_client", level="WARNING") as cm:
+            parsed = _parse_checked(run)
+        self.assertEqual(parsed.text, "ok")
+        joined_logs = "\n".join(cm.output)
+        self.assertIn("exited 1", joined_logs)
+        self.assertIn("accepting", joined_logs)
 
     def test_success_clears_active_process(self):
         client = self._client()
@@ -520,11 +980,11 @@ class VisionRoutingTests(unittest.TestCase):
         def _fake_run(prompt, system_prompt, model, timeout, image_dir=None):
             captured["prompt"] = prompt
             captured["image_dir"] = image_dir
-            return [json.dumps({
+            return _run([json.dumps({
                 "type": "result", "subtype": "success", "is_error": False,
                 "api_error_status": None, "stop_reason": "end_turn",
                 "result": "a tiny image", "usage": {},
-            })]
+            })])
 
         client._run_claude = _fake_run
         messages = [
@@ -551,11 +1011,11 @@ class VisionRoutingTests(unittest.TestCase):
 
         def _fake_run(prompt, system_prompt, model, timeout, image_dir=None):
             captured["image_dir"] = image_dir
-            return [json.dumps({
+            return _run([json.dumps({
                 "type": "result", "subtype": "success", "is_error": False,
                 "api_error_status": None, "stop_reason": "end_turn",
                 "result": "hi", "usage": {},
-            })]
+            })])
 
         client._run_claude = _fake_run
         client.chat.completions.create(
@@ -605,6 +1065,257 @@ class RunClaudeImageArgsTests(unittest.TestCase):
         # Read tool must NOT be granted on a plain text turn.
         self.assertNotIn("--allowedTools", cmd)
         self.assertNotIn("--add-dir", cmd)
+
+
+class ParseCheckedTests(unittest.TestCase):
+    """``_parse_checked`` raises on any "no terminal result event" shape and
+    accepts a complete result event even when the process exited nonzero."""
+
+    def _lines(self, *objs):
+        return [json.dumps(o) for o in objs]
+
+    def test_truncated_stream_no_result_event_exit_0_raises(self):
+        # assistant events only, stream ends without a `result` event, exit 0
+        # (e.g. the child was killed/crashed after emitting partial output).
+        lines = self._lines(
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "partial reply"}], "usage": {}}},
+        )
+        run = _run(lines, returncode=0, stderr="")
+        with self.assertRaises(ClaudeCliError) as cm:
+            _parse_checked(run)
+        self.assertIn("no terminal result event (exit=0)", str(cm.exception))
+
+    def test_empty_stdout_exit_0_raises(self):
+        run = _run([], returncode=0, stderr="")
+        with self.assertRaises(ClaudeCliError) as cm:
+            _parse_checked(run)
+        self.assertIn("no terminal result event (exit=0)", str(cm.exception))
+
+    def test_nonzero_exit_with_complete_result_event_is_accepted(self):
+        lines = [_result_line("ok", input_tokens=1, output_tokens=1)]
+        run = _run(lines, returncode=3, stderr="")
+        with self.assertLogs("agent.claude_cli_client", level="WARNING") as cm:
+            parsed = _parse_checked(run)
+        self.assertEqual(parsed.text, "ok")
+        joined_logs = "\n".join(cm.output)
+        self.assertIn("exited 3", joined_logs)
+        self.assertIn("accepting", joined_logs)
+
+    def test_raise_message_includes_stderr_snippet(self):
+        run = _run([], returncode=1, stderr="  boom details  ")
+        with self.assertRaises(ClaudeCliError) as cm:
+            _parse_checked(run)
+        self.assertIn("boom details", str(cm.exception))
+
+    def test_raise_message_no_stderr_placeholder(self):
+        run = _run([], returncode=1, stderr="")
+        with self.assertRaises(ClaudeCliError) as cm:
+            _parse_checked(run)
+        self.assertIn("<no stderr>", str(cm.exception))
+
+    def test_quota_wording_in_stderr_classifies_as_quota_error(self):
+        # The no-result-event raise routes through _classify_cli_error, so
+        # quota wording in stderr yields the same specific class as the
+        # result-event error path.
+        run = _run(
+            [], returncode=1,
+            stderr="You're out of extra usage. Add more at claude.ai/settings/usage.",
+        )
+        with self.assertRaises(ClaudeCliQuotaError) as cm:
+            _parse_checked(run)
+        self.assertIn("no terminal result event (exit=1)", str(cm.exception))
+
+
+class RepairComposesWithNoResultEventTests(unittest.TestCase):
+    """The repair retry's except-Exception fallback must also catch the new
+    'no terminal result event' raise from `_parse_checked` and deliver the
+    original text — this is a composition test, not a re-implementation."""
+
+    def _client(self):
+        return ClaudeCliClient(model="claude-opus-4-8")
+
+    def test_repair_run_trips_no_result_event_raise_falls_back_to_original(self):
+        original_text = "Done!\n<tool_call>{not valid json}</tool_call>"
+        first_lines = [_result_line(original_text, input_tokens=10, output_tokens=20)]
+        # Second run: assistant-only partial output, no terminal result event.
+        truncated_lines = [json.dumps({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "retry partial"}], "usage": {}},
+        })]
+
+        client = self._client()
+        mock_run = MagicMock(side_effect=[_run(first_lines), _run(truncated_lines, returncode=0)])
+        client._run_claude = mock_run
+
+        with self.assertLogs("agent.claude_cli_client", level="WARNING") as cm:
+            resp = client.chat.completions.create(
+                model="claude-opus-4-8",
+                messages=[{"role": "user", "content": "do something"}],
+            )
+
+        self.assertEqual(mock_run.call_count, 2)
+        self.assertEqual(resp.choices[0].finish_reason, "stop")
+        self.assertIn("not valid json", resp.choices[0].message.content)
+        self.assertFalse(resp.choices[0].message.tool_calls)
+        # Only the original run's usage is counted.
+        self.assertEqual(resp.usage.prompt_tokens, 10)
+        self.assertEqual(resp.usage.completion_tokens, 20)
+        joined_logs = "\n".join(cm.output)
+        self.assertIn("repair attempt raised", joined_logs)
+        self.assertIn("ClaudeCliError", joined_logs)
+        self.assertIn("no terminal result", joined_logs)
+
+
+class DroppedContentBlockTests(unittest.TestCase):
+    """Non-text content blocks (tool_use, thinking, ...) in assistant events
+    are dropped from the accumulated text but must be logged, not silent."""
+
+    def _lines(self, *objs):
+        return [json.dumps(o) for o in objs]
+
+    def test_tool_use_and_thinking_blocks_logged_once_with_types_and_count(self):
+        lines = self._lines(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "hello "},
+                        {"type": "tool_use", "id": "t1", "name": "Read", "input": {}},
+                        {"type": "thinking", "thinking": "pondering..."},
+                        {"type": "text", "text": "world"},
+                    ],
+                    "usage": {},
+                },
+            },
+            {
+                "type": "result", "subtype": "success", "is_error": False,
+                "api_error_status": None, "stop_reason": "end_turn",
+                "result": "hello world", "usage": {}, "total_cost_usd": 0.0,
+            },
+        )
+        with self.assertLogs("agent.claude_cli_client", level="WARNING") as cm:
+            parsed = _parse_stream_json_lines(lines)
+        self.assertEqual(parsed.text, "hello world")
+        joined_logs = "\n".join(cm.output)
+        # Exactly one warning, mentioning the count and both type names.
+        warnings = [l for l in cm.output if "ignored" in l and "non-text content block" in l]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("2", warnings[0])
+        self.assertIn("thinking", warnings[0])
+        self.assertIn("tool_use", warnings[0])
+
+    def test_dropped_block_warning_fires_on_end_of_stream_path_too(self):
+        # No terminal result event: the warning must still fire (both exit
+        # paths of _parse_stream_json_lines log dropped blocks).
+        lines = self._lines(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}},
+                        {"type": "text", "text": "partial"},
+                    ],
+                    "usage": {},
+                },
+            },
+        )
+        with self.assertLogs("agent.claude_cli_client", level="WARNING") as cm:
+            parsed = _parse_stream_json_lines(lines)
+        self.assertEqual(parsed.text, "partial")
+        self.assertIsNone(parsed.raw_result)
+        joined_logs = "\n".join(cm.output)
+        self.assertIn("ignored 1 non-text content block", joined_logs)
+        self.assertIn("tool_use", joined_logs)
+
+    def test_no_warning_when_all_blocks_are_text(self):
+        lines = self._lines(
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}], "usage": {}}},
+            {
+                "type": "result", "subtype": "success", "is_error": False,
+                "api_error_status": None, "stop_reason": "end_turn",
+                "result": "hi", "usage": {}, "total_cost_usd": 0.0,
+            },
+        )
+        # No dropped-block warning should be logged when every content item is
+        # text. Capture records directly (assertLogs requires >=1 record, so
+        # it can't assert "none logged"); a plain handler works for that.
+        import logging
+        captured = []
+        handler = logging.Handler()
+        handler.emit = lambda record: captured.append(record.getMessage())
+        target_logger = logging.getLogger("agent.claude_cli_client")
+        target_logger.addHandler(handler)
+        try:
+            parsed = _parse_stream_json_lines(lines)
+        finally:
+            target_logger.removeHandler(handler)
+        self.assertEqual(parsed.text, "hi")
+        self.assertFalse(any("non-text content block" in m for m in captured))
+
+
+class MaxTokensFinishReasonTests(unittest.TestCase):
+    """`finish_reason` reflects `stop_reason == "max_tokens"` as "length" when
+    there are no tool calls; tool-call responses always keep "tool_calls"."""
+
+    def _client(self):
+        return ClaudeCliClient(model="claude-opus-4-8")
+
+    def _max_tokens_result_line(self, text, **usage_kwargs):
+        return json.dumps({
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "api_error_status": None,
+            "stop_reason": "max_tokens",
+            "result": text,
+            "usage": usage_kwargs or {},
+            "total_cost_usd": 0.0,
+        })
+
+    def test_max_tokens_no_tool_calls_yields_length(self):
+        lines = [self._max_tokens_result_line("this got cut off mid-sent")]
+        client = self._client()
+        client._run_claude = MagicMock(return_value=_run(lines))
+        resp = client.chat.completions.create(
+            model="claude-opus-4-8",
+            messages=[{"role": "user", "content": "tell me a long story"}],
+        )
+        self.assertEqual(resp.choices[0].finish_reason, "length")
+        self.assertFalse(resp.choices[0].message.tool_calls)
+
+    def test_max_tokens_with_tool_calls_yields_tool_calls(self):
+        text = '<tool_call>{"name": "read_file", "arguments": "{\\"path\\": \\"/x\\"}"}</tool_call>'
+        lines = [self._max_tokens_result_line(text)]
+        client = self._client()
+        client._run_claude = MagicMock(return_value=_run(lines))
+        resp = client.chat.completions.create(
+            model="claude-opus-4-8",
+            messages=[{"role": "user", "content": "read /x"}],
+        )
+        self.assertEqual(resp.choices[0].finish_reason, "tool_calls")
+
+    def test_end_turn_no_tool_calls_yields_stop(self):
+        lines = [_result_line("a normal complete reply")]
+        client = self._client()
+        client._run_claude = MagicMock(return_value=_run(lines))
+        resp = client.chat.completions.create(
+            model="claude-opus-4-8",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        self.assertEqual(resp.choices[0].finish_reason, "stop")
+
+
+class ToolMarkupInstructionTests(unittest.TestCase):
+    """TOOL_MARKUP_INSTRUCTION must forbid narrating an action instead of
+    emitting the <tool_call> that actually performs it — the failure mode
+    this text-markup regime is prone to (model says "I've created the file"
+    with no tool call ever executed)."""
+
+    def test_forbids_claiming_unexecuted_actions(self):
+        self.assertIn("Saying you did something does not do it", TOOL_MARKUP_INSTRUCTION)
+
+    def test_no_longer_contains_old_plain_text_bullet(self):
+        self.assertNotIn("just answer the user normally", TOOL_MARKUP_INSTRUCTION)
 
 
 if __name__ == "__main__":

@@ -224,7 +224,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Tool-use enforcement: tells the model to actually call tools instead
     # of describing intended actions.  Controlled by config.yaml
     # agent.tool_use_enforcement:
-    #   "auto" (default) — matches TOOL_USE_ENFORCEMENT_MODELS
+    #   "auto" (default) — matches TOOL_USE_ENFORCEMENT_MODELS, or the claude-cli provider
     #   true  — always inject (all models)
     #   false — never inject
     #   list  — custom model-name substrings to match
@@ -239,9 +239,20 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             model_lower = (agent.model or "").lower()
             _inject = any(p.lower() in model_lower for p in _enforce if isinstance(p, str))
         else:
-            # "auto" or any unrecognised value — use hardcoded defaults
+            # "auto" or any unrecognised value — use hardcoded defaults, plus
+            # the claude-cli provider. claude-cli drives Claude through the
+            # <tool_call> text-markup protocol rather than native API tool
+            # calling — the same weak-tool-calling regime this guidance
+            # targets for gpt/gemini/etc — so it narrates actions instead of
+            # calling tools unless nudged. Gated on provider (not by adding
+            # "claude" to TOOL_USE_ENFORCEMENT_MODELS) so native
+            # anthropic/bedrock Claude users, who call tools natively, are
+            # unaffected.
             model_lower = (agent.model or "").lower()
-            _inject = any(p in model_lower for p in TOOL_USE_ENFORCEMENT_MODELS)
+            _is_claude_cli = agent.provider == "claude-cli" or str(
+                getattr(agent, "base_url", "") or ""
+            ).startswith("claude-cli://")
+            _inject = _is_claude_cli or any(p in model_lower for p in TOOL_USE_ENFORCEMENT_MODELS)
         if _inject:
             stable_parts.append(TOOL_USE_ENFORCEMENT_GUIDANCE)
             _model_lower = (agent.model or "").lower()

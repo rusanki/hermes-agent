@@ -60,7 +60,7 @@ CLAUDE_CLI_MARKER_BASE_URL = "claude-cli://local"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
 _DEFAULT_MODEL = "claude-opus-4-8"
 
-_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 _TOOL_CALL_JSON_RE = re.compile(r"\{\s*\"id\"\s*:\s*\"[^\"]+\"\s*,\s*\"type\"\s*:\s*\"function\"\s*,\s*\"function\"\s*:\s*\{.*?\}\s*\}", re.DOTALL)
 
 
@@ -317,20 +317,48 @@ def _format_messages_as_prompt(
     return "\n\n".join(section.strip() for section in sections if section and section.strip())
 
 
-def _extract_tool_calls_from_text(text: str) -> tuple[list[SimpleNamespace], str]:
+_MALFORMED_RAW_CAP = 500
+
+# Bare opening tag, used only to detect an unclosed ``<tool_call>`` left over
+# after well-formed blocks have been matched/consumed (the truncated-output
+# signature: output cut off by max_tokens/timeout mid-block).
+_TOOL_CALL_OPEN_TAG_RE = re.compile(r"<tool_call>")
+
+
+def _extract_tool_calls_from_text(
+    text: str,
+) -> tuple[list[SimpleNamespace], str, list[dict[str, str]]]:
+    """Pull ``<tool_call>`` markup out of ``text``.
+
+    Returns ``(extracted, cleaned, malformed)``:
+
+    * ``extracted`` — successfully parsed tool calls, in document order.
+    * ``cleaned`` — ``text`` with only the SUCCESSFULLY parsed blocks' spans
+      removed. A block that fails to parse (bad JSON, non-dict result, missing
+      blank ``name``) is never consumed — its raw markup stays in ``cleaned``
+      so the evidence is never silently deleted.
+    * ``malformed`` — ``[{"raw": <matched block text, capped>, "error": <str>}]``
+      for every block that failed to parse, plus an entry for a trailing
+      unclosed ``<tool_call>`` opening tag with no matching close (the
+      truncated-output signature), in document order.
+    """
+
     if not isinstance(text, str) or not text.strip():
-        return [], ""
+        return [], "", []
 
     extracted: list[SimpleNamespace] = []
+    malformed: list[dict[str, str]] = []
     consumed_spans: list[tuple[int, int]] = []
 
-    def _try_add_tool_call(raw_json: str) -> None:
+    def _try_add_tool_call(raw_json: str) -> str | None:
+        """Attempt to parse+append a tool call. Returns an error string on
+        failure, or ``None`` on success."""
         try:
             obj = json.loads(raw_json)
-        except Exception:
-            return
+        except Exception as exc:
+            return f"invalid JSON: {exc}"
         if not isinstance(obj, dict):
-            return
+            return f"parsed JSON is not an object (got {type(obj).__name__})"
         # Accept both the OpenAI ``function``-wrapped shape and the flat
         # ``{"name", "arguments"}`` shape. The flat shape is what
         # ``_format_messages_as_prompt`` renders into ``<tool_call>`` blocks,
@@ -341,7 +369,7 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[SimpleNamespace], str
             fn = obj
         fn_name = fn.get("name")
         if not isinstance(fn_name, str) or not fn_name.strip():
-            return
+            return "missing or blank \"name\""
         fn_args = fn.get("arguments", "{}")
         if not isinstance(fn_args, str):
             fn_args = json.dumps(fn_args, ensure_ascii=False)
@@ -358,21 +386,57 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[SimpleNamespace], str
                 function=SimpleNamespace(name=fn_name.strip(), arguments=fn_args),
             )
         )
+        return None
 
-    for m in _TOOL_CALL_BLOCK_RE.finditer(text):
+    def _record_malformed(raw: str, error: str) -> None:
+        malformed.append({"raw": raw[:_MALFORMED_RAW_CAP], "error": error})
+
+    block_matches = list(_TOOL_CALL_BLOCK_RE.finditer(text))
+    for m in block_matches:
         raw = m.group(1)
-        _try_add_tool_call(raw)
-        consumed_spans.append((m.start(), m.end()))
+        error = _try_add_tool_call(raw)
+        if error is None:
+            consumed_spans.append((m.start(), m.end()))
+        else:
+            _record_malformed(m.group(0), error)
 
-    # Only try bare-JSON fallback when no XML blocks were found.
-    if not extracted:
+    # Only try bare-JSON fallback when no XML blocks were found at all (valid
+    # or malformed) — a message that used <tool_call> markup, however broken,
+    # should not also be scanned for bare-JSON tool-call-shaped objects.
+    if not block_matches:
         for m in _TOOL_CALL_JSON_RE.finditer(text):
             raw = m.group(0)
-            _try_add_tool_call(raw)
-            consumed_spans.append((m.start(), m.end()))
+            error = _try_add_tool_call(raw)
+            if error is None:
+                consumed_spans.append((m.start(), m.end()))
+            # Bare-JSON fallback matches are heuristic pattern hits, not
+            # explicit <tool_call> markup; a failure here is not reported as
+            # a malformed *block* (there is no tag pair to point to).
+
+    # Unclosed-tag detection: an opening <tool_call> that has no matching
+    # close is the truncated-output signature. Only look at open-tag
+    # occurrences that fall outside every span already matched by the block
+    # regex (a matched block's own opening tag is not "unclosed").
+    # Document order of `malformed` holds with this entry appended last: an
+    # unmatched open tag can never precede a later ``</tool_call>`` — the
+    # block regex would have consumed it — so any unclosed tag necessarily
+    # lies after every matched (valid or malformed) block.
+    matched_block_spans = [(m.start(), m.end()) for m in block_matches]
+
+    def _inside_any_block(pos: int) -> bool:
+        return any(start <= pos < end for start, end in matched_block_spans)
+
+    for m in _TOOL_CALL_OPEN_TAG_RE.finditer(text):
+        if _inside_any_block(m.start()):
+            continue
+        _record_malformed(
+            text[m.start():m.start() + _MALFORMED_RAW_CAP],
+            "unclosed <tool_call> tag",
+        )
+        break  # only the first unclosed tag matters; nothing after it parses
 
     if not consumed_spans:
-        return extracted, text.strip()
+        return extracted, text.strip(), malformed
 
     consumed_spans.sort()
     merged: list[tuple[int, int]] = []
@@ -392,7 +456,7 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[SimpleNamespace], str
         parts.append(text[cursor:])
 
     cleaned = "\n".join(p.strip() for p in parts if p and p.strip()).strip()
-    return extracted, cleaned
+    return extracted, cleaned, malformed
 
 
 class ClaudeCliError(RuntimeError):
@@ -462,6 +526,15 @@ def _parse_stream_json_lines(lines: Any) -> SimpleNamespace:
 
     buffer: list[str] = []
     last_usage: dict[str, Any] = {}
+    dropped_types: list[str] = []
+
+    def _log_dropped_blocks() -> None:
+        if dropped_types:
+            logger.warning(
+                "claude-cli: ignored %d non-text content block(s): %s",
+                len(dropped_types),
+                sorted(set(dropped_types)),
+            )
 
     for line in lines:
         try:
@@ -479,10 +552,17 @@ def _parse_stream_json_lines(lines: Any) -> SimpleNamespace:
                 content = message.get("content")
                 if isinstance(content, list):
                     for item in content:
-                        if isinstance(item, dict) and item.get("type") == "text":
+                        if not isinstance(item, dict):
+                            continue
+                        item_type = item.get("type")
+                        if item_type == "text":
                             text = item.get("text")
                             if isinstance(text, str):
                                 buffer.append(text)
+                        else:
+                            dropped_types.append(
+                                item_type if isinstance(item_type, str) else "unknown"
+                            )
                 usage = message.get("usage")
                 if isinstance(usage, dict):
                     last_usage = usage
@@ -504,6 +584,7 @@ def _parse_stream_json_lines(lines: Any) -> SimpleNamespace:
                 cost_usd = 0.0
             result_text = obj.get("result")
             text = result_text if isinstance(result_text, str) and result_text else "".join(buffer)
+            _log_dropped_blocks()
             return SimpleNamespace(
                 text=text,
                 stop_reason=obj.get("stop_reason"),
@@ -519,6 +600,7 @@ def _parse_stream_json_lines(lines: Any) -> SimpleNamespace:
         # Unknown / "system" events are ignored.
 
     # No terminal result event seen — return what we accumulated.
+    _log_dropped_blocks()
     return SimpleNamespace(
         text="".join(buffer),
         stop_reason=None,
@@ -526,6 +608,46 @@ def _parse_stream_json_lines(lines: Any) -> SimpleNamespace:
         cost_usd=0.0,
         raw_result=None,
     )
+
+
+def _parse_checked(run: SimpleNamespace) -> SimpleNamespace:
+    """Parse ``run.lines`` and raise if no terminal ``result`` event was seen.
+
+    ``run`` is the :class:`SimpleNamespace` returned by ``_run_claude``
+    (``lines``, ``returncode``, ``stderr``). A missing terminal ``result``
+    event (``parsed.raw_result is None``) covers every "silent failure" shape:
+    a truncated/killed stream, an empty stdout with exit 0, and a nonzero exit
+    with unparseable partial stdout. All of these are surfaced as a
+    :class:`ClaudeCliError` instead of being handed to the caller as if they
+    were a normal (if short) reply.
+
+    If a complete ``result`` event WAS seen but the process still exited
+    nonzero, the result is accepted (the CLI can exit nonzero for reasons
+    unrelated to the inference result, e.g. a post-response cleanup hiccup)
+    and a warning is logged so the discrepancy is not silently invisible.
+
+    Raising here is safe: the conversation loop retries API-call exceptions up
+    to ``agent.api_max_retries`` before surfacing the error to the user — a
+    paid-retries-then-error tradeoff chosen over delivering truncated output
+    as an answer.
+    """
+
+    parsed = _parse_stream_json_lines(run.lines)
+    if parsed.raw_result is None:
+        stderr_snippet = (run.stderr or "").strip()[:2000]
+        # Route through the classifier so quota/auth wording in stderr maps to
+        # the same specific error classes as the result-event error path.
+        raise _classify_cli_error(
+            f"claude CLI produced no terminal result event (exit={run.returncode}): "
+            + (stderr_snippet or "<no stderr>")
+        )
+    if run.returncode != 0:
+        logger.warning(
+            "claude-cli: process exited %d but produced a complete result "
+            "event; accepting",
+            run.returncode,
+        )
+    return parsed
 
 
 def _resolve_home_dir() -> str:
@@ -627,7 +749,11 @@ TOOL_MARKUP_INSTRUCTION = (
     "- Do NOT apologize for lacking tools and do NOT claim you cannot perform an "
     "action — instead emit the appropriate <tool_call> and let Hermes execute "
     "it.\n"
-    "- If no tool is needed, just answer the user normally with plain text."
+    "- If (and only if) no action is needed, answer the user in plain text.\n"
+    "- NEVER state or imply that you have performed an action (created, wrote, "
+    "ran, fixed, scheduled, installed...) unless that action's <tool_call> was "
+    "already executed and its <tool_response> is visible in the transcript. "
+    "Saying you did something does not do it — emit the <tool_call>."
 )
 
 
@@ -810,23 +936,83 @@ class ClaudeCliClient:
         try:
             if image_paths:
                 prompt = _augment_prompt_with_image_paths(prompt, image_paths)
-            lines = self._run_claude(
+            run = self._run_claude(
                 prompt, sys_prompt, eff_model, timeout, image_dir=image_dir,
             )
         finally:
             self._cleanup_image_dir(image_dir)
-        parsed = _parse_stream_json_lines(lines)
-        tool_calls, cleaned = _extract_tool_calls_from_text(parsed.text)
+        parsed = _parse_checked(run)
+        tool_calls, cleaned, malformed = _extract_tool_calls_from_text(parsed.text)
+
+        extra_usage: dict[str, Any] | None = None
+        if malformed:
+            logger.warning(
+                "claude-cli: %d malformed <tool_call> block(s): %s; first block: %.200s",
+                len(malformed),
+                [m["error"] for m in malformed],
+                malformed[0]["raw"],
+            )
+            if not tool_calls:
+                if image_paths:
+                    # No repair for image-bearing turns: the per-call image
+                    # scratch dir is already cleaned up above, and the repair
+                    # run executes with tools disabled — the retry model would
+                    # be told to Read a file it can no longer access.
+                    logger.warning(
+                        "claude-cli: skipping repair retry for image-bearing turn"
+                    )
+                else:
+                    # Exactly one repair attempt: ask the model to re-emit its
+                    # reply with valid <tool_call> markup, never recursing on
+                    # the retry's own result (max 2 subprocess runs total).
+                    try:
+                        retry_tool_calls, retry_cleaned, retry_usage = (
+                            self._attempt_repair(
+                                prompt, sys_prompt, eff_model, timeout,
+                                parsed.text, malformed[0]["error"],
+                            )
+                        )
+                    except Exception as exc:
+                        # A repair-run failure must never destroy the original
+                        # result — fall through to the original-text fallback.
+                        logger.warning(
+                            "claude-cli: repair attempt raised %s: %s; "
+                            "delivering original text",
+                            type(exc).__name__,
+                            exc,
+                        )
+                    else:
+                        # Retry tokens are real cost: sum usage whenever the
+                        # retry ran, even if it failed to produce a valid call.
+                        extra_usage = retry_usage
+                        if retry_tool_calls:
+                            tool_calls, cleaned = retry_tool_calls, retry_cleaned
+                            logger.info(
+                                "claude-cli: repair retry succeeded with %d "
+                                "tool call(s)",
+                                len(tool_calls),
+                            )
+                        else:
+                            logger.warning(
+                                "claude-cli: repair attempt failed to produce "
+                                "a valid tool call; delivering original text"
+                            )
+                            # Fall back to the ORIGINAL parsed/cleaned result —
+                            # the malformed block(s) stay visible in `cleaned`
+                            # already.
 
         prompt_tokens = parsed.usage.get("input_tokens", 0)
         completion_tokens = parsed.usage.get("output_tokens", 0)
+        cached_tokens = parsed.usage.get("cache_read_input_tokens", 0)
+        if extra_usage:
+            prompt_tokens += extra_usage.get("input_tokens", 0)
+            completion_tokens += extra_usage.get("output_tokens", 0)
+            cached_tokens += extra_usage.get("cache_read_input_tokens", 0)
         usage = SimpleNamespace(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
-            prompt_tokens_details=SimpleNamespace(
-                cached_tokens=parsed.usage.get("cache_read_input_tokens", 0)
-            ),
+            prompt_tokens_details=SimpleNamespace(cached_tokens=cached_tokens),
         )
         assistant_message = SimpleNamespace(
             content=cleaned,
@@ -835,9 +1021,58 @@ class ClaudeCliClient:
             reasoning_content=None,
             reasoning_details=None,
         )
-        finish_reason = "tool_calls" if tool_calls else "stop"
+        if tool_calls:
+            finish_reason = "tool_calls"
+        elif parsed.stop_reason == "max_tokens":
+            # Governing result: `parsed` (the original run's parsed result) is
+            # the right source here even when a repair retry ran — the retry
+            # branch only overrides `tool_calls`/`cleaned` when it produced a
+            # valid call, and this branch is only reached when there are none.
+            finish_reason = "length"
+        else:
+            finish_reason = "stop"
         choice = SimpleNamespace(message=assistant_message, finish_reason=finish_reason)
         return SimpleNamespace(choices=[choice], usage=usage, model=eff_model)
+
+    def _attempt_repair(
+        self,
+        prompt: str,
+        sys_prompt: str,
+        eff_model: str,
+        timeout: float | None,
+        original_text: str,
+        first_error: str,
+    ) -> tuple[list[SimpleNamespace], str, dict[str, Any]]:
+        """Run exactly one repair retry after a malformed-only reply.
+
+        Re-prompts the model with its own previous (malformed) reply and asks
+        it to re-emit valid ``<tool_call>`` markup. The retry's own result is
+        never repaired again, so this performs at most one extra subprocess
+        run (no recursion).
+
+        Returns ``(tool_calls, cleaned, usage)`` — ``usage`` is the retry
+        run's raw usage dict, which the caller must sum into the response
+        usage regardless of whether the retry produced a valid call (retry
+        tokens are real cost either way).
+        """
+
+        repair_prompt = (
+            prompt
+            + "\n\nAssistant: " + original_text
+            + "\n\nUser: Your previous reply contained a malformed <tool_call> "
+            "block (error: " + first_error + "). Re-emit your reply now with "
+            "each tool call as exactly one valid JSON object inside "
+            "<tool_call></tool_call> tags. Do not describe an action in prose "
+            "without emitting its <tool_call>."
+        )
+        retry_run = self._run_claude(
+            repair_prompt, sys_prompt, eff_model, timeout, image_dir=None,
+        )
+        retry_parsed = _parse_checked(retry_run)
+        retry_tool_calls, retry_cleaned, _retry_malformed = _extract_tool_calls_from_text(
+            retry_parsed.text
+        )
+        return retry_tool_calls, retry_cleaned, retry_parsed.usage
 
     def _run_claude(
         self,
@@ -846,7 +1081,7 @@ class ClaudeCliClient:
         model: str,
         timeout: float | None,
         image_dir: str | None = None,
-    ) -> list[str]:
+    ) -> SimpleNamespace:
         # Normalise timeout: run_agent.py may pass an httpx.Timeout object
         # (used natively by the OpenAI SDK) rather than a plain float.
         if timeout is None:
@@ -932,7 +1167,11 @@ class ClaudeCliClient:
                     f"claude CLI exited with code {proc.returncode}"
                     + (f": {stderr_snippet}" if stderr_snippet else "")
                 )
-            return stdout.splitlines()
+            return SimpleNamespace(
+                lines=stdout.splitlines(),
+                returncode=proc.returncode,
+                stderr=stderr or "",
+            )
         finally:
             with self._active_process_lock:
                 if self._active_process is proc:

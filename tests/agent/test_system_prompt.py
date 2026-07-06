@@ -96,3 +96,75 @@ class TestCodingContextBlock:
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         agent = _make_agent(valid_tool_names=[], platform="cli")
         assert "coding agent" not in _stable_prompt(agent)
+
+
+class TestToolUseEnforcementClaudeCli:
+    """claude-cli talks to Claude via text-markup <tool_call> blocks rather than
+    native API tool calling — the same weak-tool-calling regime
+    TOOL_USE_ENFORCEMENT_GUIDANCE targets for gpt/gemini/etc. Under "auto" it
+    must also be injected for the claude-cli provider, gated on provider (not
+    by adding "claude" to TOOL_USE_ENFORCEMENT_MODELS, which would also fire
+    for native anthropic/bedrock Claude users who don't need it)."""
+
+    def test_injected_for_claude_cli_provider_under_auto(self):
+        agent = _make_agent(
+            valid_tool_names=["read_file"],
+            provider="claude-cli",
+            _tool_use_enforcement="auto",
+        )
+        assert "Tool-use enforcement" in _stable_prompt(agent)
+
+    def test_injected_for_claude_cli_base_url_under_auto(self):
+        agent = _make_agent(
+            valid_tool_names=["read_file"],
+            provider="",
+            base_url="claude-cli://local",
+            _tool_use_enforcement="auto",
+        )
+        assert "Tool-use enforcement" in _stable_prompt(agent)
+
+    def test_absent_for_native_anthropic_under_auto(self):
+        # Upstream behavior preserved: native API tool calling doesn't need it.
+        agent = _make_agent(
+            valid_tool_names=["read_file"],
+            provider="anthropic",
+            model="claude-opus-4-8",
+            _tool_use_enforcement="auto",
+        )
+        assert "Tool-use enforcement" not in _stable_prompt(agent)
+
+    def test_absent_for_claude_cli_when_explicitly_off(self):
+        agent = _make_agent(
+            valid_tool_names=["read_file"],
+            provider="claude-cli",
+            _tool_use_enforcement=False,
+        )
+        assert "Tool-use enforcement" not in _stable_prompt(agent)
+
+    def test_absent_for_claude_cli_when_list_does_not_match(self):
+        # The claude-cli OR-condition lives only in the auto branch — an
+        # explicit non-matching list must not be overridden.
+        agent = _make_agent(
+            valid_tool_names=["read_file"],
+            provider="claude-cli",
+            _tool_use_enforcement=["gpt"],
+        )
+        assert "Tool-use enforcement" not in _stable_prompt(agent)
+
+    def test_no_google_or_openai_followon_for_claude_cli(self):
+        # Realistic production model string (not the default "") so the
+        # follow-on-absence assertions aren't trivially true.
+        agent = _make_agent(
+            valid_tool_names=["read_file"],
+            provider="claude-cli",
+            model="claude-cli/claude-opus-4-8",
+            _tool_use_enforcement="auto",
+        )
+        stable = _stable_prompt(agent)
+        assert "Tool-use enforcement" in stable
+        from agent.prompt_builder import (
+            GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
+            OPENAI_MODEL_EXECUTION_GUIDANCE,
+        )
+        assert GOOGLE_MODEL_OPERATIONAL_GUIDANCE not in stable
+        assert OPENAI_MODEL_EXECUTION_GUIDANCE not in stable
