@@ -526,6 +526,15 @@ def _parse_stream_json_lines(lines: Any) -> SimpleNamespace:
 
     buffer: list[str] = []
     last_usage: dict[str, Any] = {}
+    dropped_types: list[str] = []
+
+    def _log_dropped_blocks() -> None:
+        if dropped_types:
+            logger.warning(
+                "claude-cli: ignored %d non-text content block(s): %s",
+                len(dropped_types),
+                sorted(set(dropped_types)),
+            )
 
     for line in lines:
         try:
@@ -543,10 +552,17 @@ def _parse_stream_json_lines(lines: Any) -> SimpleNamespace:
                 content = message.get("content")
                 if isinstance(content, list):
                     for item in content:
-                        if isinstance(item, dict) and item.get("type") == "text":
+                        if not isinstance(item, dict):
+                            continue
+                        item_type = item.get("type")
+                        if item_type == "text":
                             text = item.get("text")
                             if isinstance(text, str):
                                 buffer.append(text)
+                        else:
+                            dropped_types.append(
+                                item_type if isinstance(item_type, str) else "unknown"
+                            )
                 usage = message.get("usage")
                 if isinstance(usage, dict):
                     last_usage = usage
@@ -568,6 +584,7 @@ def _parse_stream_json_lines(lines: Any) -> SimpleNamespace:
                 cost_usd = 0.0
             result_text = obj.get("result")
             text = result_text if isinstance(result_text, str) and result_text else "".join(buffer)
+            _log_dropped_blocks()
             return SimpleNamespace(
                 text=text,
                 stop_reason=obj.get("stop_reason"),
@@ -583,6 +600,7 @@ def _parse_stream_json_lines(lines: Any) -> SimpleNamespace:
         # Unknown / "system" events are ignored.
 
     # No terminal result event seen — return what we accumulated.
+    _log_dropped_blocks()
     return SimpleNamespace(
         text="".join(buffer),
         stop_reason=None,
@@ -590,6 +608,46 @@ def _parse_stream_json_lines(lines: Any) -> SimpleNamespace:
         cost_usd=0.0,
         raw_result=None,
     )
+
+
+def _parse_checked(run: SimpleNamespace) -> SimpleNamespace:
+    """Parse ``run.lines`` and raise if no terminal ``result`` event was seen.
+
+    ``run`` is the :class:`SimpleNamespace` returned by ``_run_claude``
+    (``lines``, ``returncode``, ``stderr``). A missing terminal ``result``
+    event (``parsed.raw_result is None``) covers every "silent failure" shape:
+    a truncated/killed stream, an empty stdout with exit 0, and a nonzero exit
+    with unparseable partial stdout. All of these are surfaced as a
+    :class:`ClaudeCliError` instead of being handed to the caller as if they
+    were a normal (if short) reply.
+
+    If a complete ``result`` event WAS seen but the process still exited
+    nonzero, the result is accepted (the CLI can exit nonzero for reasons
+    unrelated to the inference result, e.g. a post-response cleanup hiccup)
+    and a warning is logged so the discrepancy is not silently invisible.
+
+    Raising here is safe: the conversation loop retries API-call exceptions up
+    to ``agent.api_max_retries`` before surfacing the error to the user — a
+    paid-retries-then-error tradeoff chosen over delivering truncated output
+    as an answer.
+    """
+
+    parsed = _parse_stream_json_lines(run.lines)
+    if parsed.raw_result is None:
+        stderr_snippet = (run.stderr or "").strip()[:2000]
+        # Route through the classifier so quota/auth wording in stderr maps to
+        # the same specific error classes as the result-event error path.
+        raise _classify_cli_error(
+            f"claude CLI produced no terminal result event (exit={run.returncode}): "
+            + (stderr_snippet or "<no stderr>")
+        )
+    if run.returncode != 0:
+        logger.warning(
+            "claude-cli: process exited %d but produced a complete result "
+            "event; accepting",
+            run.returncode,
+        )
+    return parsed
 
 
 def _resolve_home_dir() -> str:
@@ -874,12 +932,12 @@ class ClaudeCliClient:
         try:
             if image_paths:
                 prompt = _augment_prompt_with_image_paths(prompt, image_paths)
-            lines = self._run_claude(
+            run = self._run_claude(
                 prompt, sys_prompt, eff_model, timeout, image_dir=image_dir,
             )
         finally:
             self._cleanup_image_dir(image_dir)
-        parsed = _parse_stream_json_lines(lines)
+        parsed = _parse_checked(run)
         tool_calls, cleaned, malformed = _extract_tool_calls_from_text(parsed.text)
 
         extra_usage: dict[str, Any] | None = None
@@ -914,8 +972,9 @@ class ClaudeCliClient:
                         # A repair-run failure must never destroy the original
                         # result — fall through to the original-text fallback.
                         logger.warning(
-                            "claude-cli: repair attempt raised %s; "
+                            "claude-cli: repair attempt raised %s: %s; "
                             "delivering original text",
+                            type(exc).__name__,
                             exc,
                         )
                     else:
@@ -958,7 +1017,16 @@ class ClaudeCliClient:
             reasoning_content=None,
             reasoning_details=None,
         )
-        finish_reason = "tool_calls" if tool_calls else "stop"
+        if tool_calls:
+            finish_reason = "tool_calls"
+        elif parsed.stop_reason == "max_tokens":
+            # Governing result: `parsed` (the original run's parsed result) is
+            # the right source here even when a repair retry ran — the retry
+            # branch only overrides `tool_calls`/`cleaned` when it produced a
+            # valid call, and this branch is only reached when there are none.
+            finish_reason = "length"
+        else:
+            finish_reason = "stop"
         choice = SimpleNamespace(message=assistant_message, finish_reason=finish_reason)
         return SimpleNamespace(choices=[choice], usage=usage, model=eff_model)
 
@@ -993,10 +1061,10 @@ class ClaudeCliClient:
             "<tool_call></tool_call> tags. Do not describe an action in prose "
             "without emitting its <tool_call>."
         )
-        retry_lines = self._run_claude(
+        retry_run = self._run_claude(
             repair_prompt, sys_prompt, eff_model, timeout, image_dir=None,
         )
-        retry_parsed = _parse_stream_json_lines(retry_lines)
+        retry_parsed = _parse_checked(retry_run)
         retry_tool_calls, retry_cleaned, _retry_malformed = _extract_tool_calls_from_text(
             retry_parsed.text
         )
@@ -1009,7 +1077,7 @@ class ClaudeCliClient:
         model: str,
         timeout: float | None,
         image_dir: str | None = None,
-    ) -> list[str]:
+    ) -> SimpleNamespace:
         # Normalise timeout: run_agent.py may pass an httpx.Timeout object
         # (used natively by the OpenAI SDK) rather than a plain float.
         if timeout is None:
@@ -1095,7 +1163,11 @@ class ClaudeCliClient:
                     f"claude CLI exited with code {proc.returncode}"
                     + (f": {stderr_snippet}" if stderr_snippet else "")
                 )
-            return stdout.splitlines()
+            return SimpleNamespace(
+                lines=stdout.splitlines(),
+                returncode=proc.returncode,
+                stderr=stderr or "",
+            )
         finally:
             with self._active_process_lock:
                 if self._active_process is proc:

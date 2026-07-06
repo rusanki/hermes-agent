@@ -6,6 +6,7 @@ import json
 import os as _os
 import subprocess
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from agent.claude_cli_client import (
     ClaudeCliClient,
@@ -16,10 +17,20 @@ from agent.claude_cli_client import (
     _render_assistant_tool_calls,
     _render_tool_response,
     _parse_stream_json_lines,
+    _parse_checked,
     ClaudeCliQuotaError,
     ClaudeCliAuthError,
     ClaudeCliError,
 )
+
+
+def _run(lines, returncode=0, stderr=""):
+    """Wrap fixture stdout lines into the ``_run_claude`` return shape.
+
+    ``_run_claude`` returns ``SimpleNamespace(lines=..., returncode=..., stderr=...)``
+    since Task 3; this mirrors that shape for mocks/fixtures across the test file.
+    """
+    return SimpleNamespace(lines=list(lines), returncode=returncode, stderr=stderr)
 
 
 class FormatterTests(unittest.TestCase):
@@ -447,7 +458,7 @@ class StreamParserTests(unittest.TestCase):
 class ClientFacadeTests(unittest.TestCase):
     def _client_with_output(self, lines):
         client = ClaudeCliClient(model="claude-opus-4-8")
-        client._run_claude = lambda prompt, system_prompt, model, timeout, image_dir=None: list(lines)
+        client._run_claude = lambda prompt, system_prompt, model, timeout, image_dir=None: _run(lines)
         return client
 
     def test_text_response_shape(self):
@@ -561,7 +572,7 @@ class RepairRetryTests(unittest.TestCase):
         second_lines = [_result_line(retry_text, input_tokens=5, output_tokens=7, cache_read=2)]
 
         client = self._client()
-        mock_run = MagicMock(side_effect=[first_lines, second_lines])
+        mock_run = MagicMock(side_effect=[_run(first_lines), _run(second_lines)])
         client._run_claude = mock_run
 
         with self.assertLogs("agent.claude_cli_client", level="INFO") as cm:
@@ -593,7 +604,7 @@ class RepairRetryTests(unittest.TestCase):
         second_lines = [_result_line(retry_text, input_tokens=5, output_tokens=7, cache_read=2)]
 
         client = self._client()
-        mock_run = MagicMock(side_effect=[first_lines, second_lines])
+        mock_run = MagicMock(side_effect=[_run(first_lines), _run(second_lines)])
         client._run_claude = mock_run
 
         with self.assertLogs("agent.claude_cli_client", level="WARNING") as cm:
@@ -625,7 +636,7 @@ class RepairRetryTests(unittest.TestCase):
         first_lines = [_result_line(original_text, input_tokens=10, output_tokens=20)]
 
         client = self._client()
-        mock_run = MagicMock(side_effect=[first_lines, ClaudeCliError("timeout")])
+        mock_run = MagicMock(side_effect=[_run(first_lines), ClaudeCliError("timeout")])
         client._run_claude = mock_run
 
         with self.assertLogs("agent.claude_cli_client", level="WARNING") as cm:
@@ -644,6 +655,8 @@ class RepairRetryTests(unittest.TestCase):
         self.assertEqual(resp.usage.completion_tokens, 20)
         joined_logs = "\n".join(cm.output)
         self.assertIn("repair attempt raised", joined_logs)
+        # The exception class name must be included per the log-tweak.
+        self.assertIn("ClaudeCliError", joined_logs)
         self.assertIn("timeout", joined_logs)
 
     def test_image_turn_malformed_skips_repair(self):
@@ -655,7 +668,7 @@ class RepairRetryTests(unittest.TestCase):
         first_lines = [_result_line(original_text)]
 
         client = self._client()
-        mock_run = MagicMock(side_effect=[first_lines])
+        mock_run = MagicMock(side_effect=[_run(first_lines)])
         client._run_claude = mock_run
 
         messages = [
@@ -686,7 +699,7 @@ class RepairRetryTests(unittest.TestCase):
         )
         lines = [_result_line(text)]
         client = self._client()
-        mock_run = MagicMock(side_effect=[lines])
+        mock_run = MagicMock(side_effect=[_run(lines)])
         client._run_claude = mock_run
 
         with self.assertLogs("agent.claude_cli_client", level="WARNING"):
@@ -703,7 +716,7 @@ class RepairRetryTests(unittest.TestCase):
     def test_no_malformed_no_repair_run(self):
         lines = [_result_line("just a normal reply", input_tokens=3, output_tokens=4)]
         client = self._client()
-        mock_run = MagicMock(side_effect=[lines])
+        mock_run = MagicMock(side_effect=[_run(lines)])
         client._run_claude = mock_run
 
         resp = client.chat.completions.create(
@@ -722,7 +735,7 @@ class RepairRetryTests(unittest.TestCase):
         second_lines = [_result_line(retry_text)]
 
         client = self._client()
-        mock_run = MagicMock(side_effect=[first_lines, second_lines])
+        mock_run = MagicMock(side_effect=[_run(first_lines), _run(second_lines)])
         client._run_claude = mock_run
 
         resp = client.chat.completions.create(
@@ -750,7 +763,7 @@ class ClientAwaitableCreateTests(unittest.TestCase):
 
     def _client_with_output(self, lines):
         client = ClaudeCliClient(model="claude-opus-4-8")
-        client._run_claude = lambda prompt, system_prompt, model, timeout, image_dir=None: list(lines)
+        client._run_claude = lambda prompt, system_prompt, model, timeout, image_dir=None: _run(lines)
         return client
 
     _LINES = [
@@ -852,19 +865,49 @@ class RunClaudeSubprocessTests(unittest.TestCase):
                 client._run_claude("p", "sys", "claude-opus-4-8", 900.0)
         self.assertIn("boom", str(cm.exception))
 
-    def test_nonzero_returncode_with_parseable_stdout_returns_lines(self):
-        # rc != 0 but stdout carries a parseable success result line: _run_claude
-        # must NOT raise and must defer to the parser by returning the lines.
+    def test_nonzero_returncode_with_partial_stdout_no_result_event_raises(self):
+        # rc != 0 and stdout has SOME content but no terminal `result` event
+        # (e.g. an assistant-only partial line): _run_claude itself must NOT
+        # raise (its own guard only fires on EMPTY stdout) — it hands back the
+        # namespace, but `_parse_checked` must then raise on the missing
+        # terminal result event, per the new contract (Task 3).
+        client = self._client()
+        partial_line = json.dumps({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "partial"}], "usage": {}},
+        })
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = (partial_line + "\n", "some stderr")
+        mock_proc.returncode = 1
+        with patch("agent.claude_cli_client.subprocess.Popen") as mock_popen:
+            mock_popen.return_value = mock_proc
+            run = client._run_claude("p", "sys", "claude-opus-4-8", 900.0)
+        self.assertEqual(run.lines, [partial_line])
+        self.assertEqual(run.returncode, 1)
+        with self.assertRaises(ClaudeCliError) as cm:
+            _parse_checked(run)
+        self.assertIn("no terminal result", str(cm.exception))
+        self.assertIn("exit=1", str(cm.exception))
+
+    def test_nonzero_returncode_with_complete_result_event_is_accepted(self):
+        # rc != 0 but stdout carries a COMPLETE terminal `result` event: this
+        # must be accepted (the parsed result is authoritative), with a
+        # warning logged noting the returncode/result-event discrepancy.
         client = self._client()
         mock_proc = MagicMock()
         mock_proc.communicate.return_value = (_SUCCESS_RESULT_LINE + "\n", "")
         mock_proc.returncode = 1
         with patch("agent.claude_cli_client.subprocess.Popen") as mock_popen:
             mock_popen.return_value = mock_proc
-            lines = client._run_claude("p", "sys", "claude-opus-4-8", 900.0)
-        self.assertEqual(lines, [_SUCCESS_RESULT_LINE])
-        # Parser later yields "ok" from these lines.
-        self.assertEqual(_parse_stream_json_lines(lines).text, "ok")
+            run = client._run_claude("p", "sys", "claude-opus-4-8", 900.0)
+        self.assertEqual(run.lines, [_SUCCESS_RESULT_LINE])
+        self.assertEqual(run.returncode, 1)
+        with self.assertLogs("agent.claude_cli_client", level="WARNING") as cm:
+            parsed = _parse_checked(run)
+        self.assertEqual(parsed.text, "ok")
+        joined_logs = "\n".join(cm.output)
+        self.assertIn("exited 1", joined_logs)
+        self.assertIn("accepting", joined_logs)
 
     def test_success_clears_active_process(self):
         client = self._client()
@@ -936,11 +979,11 @@ class VisionRoutingTests(unittest.TestCase):
         def _fake_run(prompt, system_prompt, model, timeout, image_dir=None):
             captured["prompt"] = prompt
             captured["image_dir"] = image_dir
-            return [json.dumps({
+            return _run([json.dumps({
                 "type": "result", "subtype": "success", "is_error": False,
                 "api_error_status": None, "stop_reason": "end_turn",
                 "result": "a tiny image", "usage": {},
-            })]
+            })])
 
         client._run_claude = _fake_run
         messages = [
@@ -967,11 +1010,11 @@ class VisionRoutingTests(unittest.TestCase):
 
         def _fake_run(prompt, system_prompt, model, timeout, image_dir=None):
             captured["image_dir"] = image_dir
-            return [json.dumps({
+            return _run([json.dumps({
                 "type": "result", "subtype": "success", "is_error": False,
                 "api_error_status": None, "stop_reason": "end_turn",
                 "result": "hi", "usage": {},
-            })]
+            })])
 
         client._run_claude = _fake_run
         client.chat.completions.create(
@@ -1021,6 +1064,244 @@ class RunClaudeImageArgsTests(unittest.TestCase):
         # Read tool must NOT be granted on a plain text turn.
         self.assertNotIn("--allowedTools", cmd)
         self.assertNotIn("--add-dir", cmd)
+
+
+class ParseCheckedTests(unittest.TestCase):
+    """``_parse_checked`` raises on any "no terminal result event" shape and
+    accepts a complete result event even when the process exited nonzero."""
+
+    def _lines(self, *objs):
+        return [json.dumps(o) for o in objs]
+
+    def test_truncated_stream_no_result_event_exit_0_raises(self):
+        # assistant events only, stream ends without a `result` event, exit 0
+        # (e.g. the child was killed/crashed after emitting partial output).
+        lines = self._lines(
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "partial reply"}], "usage": {}}},
+        )
+        run = _run(lines, returncode=0, stderr="")
+        with self.assertRaises(ClaudeCliError) as cm:
+            _parse_checked(run)
+        self.assertIn("no terminal result event (exit=0)", str(cm.exception))
+
+    def test_empty_stdout_exit_0_raises(self):
+        run = _run([], returncode=0, stderr="")
+        with self.assertRaises(ClaudeCliError) as cm:
+            _parse_checked(run)
+        self.assertIn("no terminal result event (exit=0)", str(cm.exception))
+
+    def test_nonzero_exit_with_complete_result_event_is_accepted(self):
+        lines = [_result_line("ok", input_tokens=1, output_tokens=1)]
+        run = _run(lines, returncode=3, stderr="")
+        with self.assertLogs("agent.claude_cli_client", level="WARNING") as cm:
+            parsed = _parse_checked(run)
+        self.assertEqual(parsed.text, "ok")
+        joined_logs = "\n".join(cm.output)
+        self.assertIn("exited 3", joined_logs)
+        self.assertIn("accepting", joined_logs)
+
+    def test_raise_message_includes_stderr_snippet(self):
+        run = _run([], returncode=1, stderr="  boom details  ")
+        with self.assertRaises(ClaudeCliError) as cm:
+            _parse_checked(run)
+        self.assertIn("boom details", str(cm.exception))
+
+    def test_raise_message_no_stderr_placeholder(self):
+        run = _run([], returncode=1, stderr="")
+        with self.assertRaises(ClaudeCliError) as cm:
+            _parse_checked(run)
+        self.assertIn("<no stderr>", str(cm.exception))
+
+    def test_quota_wording_in_stderr_classifies_as_quota_error(self):
+        # The no-result-event raise routes through _classify_cli_error, so
+        # quota wording in stderr yields the same specific class as the
+        # result-event error path.
+        run = _run(
+            [], returncode=1,
+            stderr="You're out of extra usage. Add more at claude.ai/settings/usage.",
+        )
+        with self.assertRaises(ClaudeCliQuotaError) as cm:
+            _parse_checked(run)
+        self.assertIn("no terminal result event (exit=1)", str(cm.exception))
+
+
+class RepairComposesWithNoResultEventTests(unittest.TestCase):
+    """The repair retry's except-Exception fallback must also catch the new
+    'no terminal result event' raise from `_parse_checked` and deliver the
+    original text — this is a composition test, not a re-implementation."""
+
+    def _client(self):
+        return ClaudeCliClient(model="claude-opus-4-8")
+
+    def test_repair_run_trips_no_result_event_raise_falls_back_to_original(self):
+        original_text = "Done!\n<tool_call>{not valid json}</tool_call>"
+        first_lines = [_result_line(original_text, input_tokens=10, output_tokens=20)]
+        # Second run: assistant-only partial output, no terminal result event.
+        truncated_lines = [json.dumps({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "retry partial"}], "usage": {}},
+        })]
+
+        client = self._client()
+        mock_run = MagicMock(side_effect=[_run(first_lines), _run(truncated_lines, returncode=0)])
+        client._run_claude = mock_run
+
+        with self.assertLogs("agent.claude_cli_client", level="WARNING") as cm:
+            resp = client.chat.completions.create(
+                model="claude-opus-4-8",
+                messages=[{"role": "user", "content": "do something"}],
+            )
+
+        self.assertEqual(mock_run.call_count, 2)
+        self.assertEqual(resp.choices[0].finish_reason, "stop")
+        self.assertIn("not valid json", resp.choices[0].message.content)
+        self.assertFalse(resp.choices[0].message.tool_calls)
+        # Only the original run's usage is counted.
+        self.assertEqual(resp.usage.prompt_tokens, 10)
+        self.assertEqual(resp.usage.completion_tokens, 20)
+        joined_logs = "\n".join(cm.output)
+        self.assertIn("repair attempt raised", joined_logs)
+        self.assertIn("ClaudeCliError", joined_logs)
+        self.assertIn("no terminal result", joined_logs)
+
+
+class DroppedContentBlockTests(unittest.TestCase):
+    """Non-text content blocks (tool_use, thinking, ...) in assistant events
+    are dropped from the accumulated text but must be logged, not silent."""
+
+    def _lines(self, *objs):
+        return [json.dumps(o) for o in objs]
+
+    def test_tool_use_and_thinking_blocks_logged_once_with_types_and_count(self):
+        lines = self._lines(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "hello "},
+                        {"type": "tool_use", "id": "t1", "name": "Read", "input": {}},
+                        {"type": "thinking", "thinking": "pondering..."},
+                        {"type": "text", "text": "world"},
+                    ],
+                    "usage": {},
+                },
+            },
+            {
+                "type": "result", "subtype": "success", "is_error": False,
+                "api_error_status": None, "stop_reason": "end_turn",
+                "result": "hello world", "usage": {}, "total_cost_usd": 0.0,
+            },
+        )
+        with self.assertLogs("agent.claude_cli_client", level="WARNING") as cm:
+            parsed = _parse_stream_json_lines(lines)
+        self.assertEqual(parsed.text, "hello world")
+        joined_logs = "\n".join(cm.output)
+        # Exactly one warning, mentioning the count and both type names.
+        warnings = [l for l in cm.output if "ignored" in l and "non-text content block" in l]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("2", warnings[0])
+        self.assertIn("thinking", warnings[0])
+        self.assertIn("tool_use", warnings[0])
+
+    def test_dropped_block_warning_fires_on_end_of_stream_path_too(self):
+        # No terminal result event: the warning must still fire (both exit
+        # paths of _parse_stream_json_lines log dropped blocks).
+        lines = self._lines(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}},
+                        {"type": "text", "text": "partial"},
+                    ],
+                    "usage": {},
+                },
+            },
+        )
+        with self.assertLogs("agent.claude_cli_client", level="WARNING") as cm:
+            parsed = _parse_stream_json_lines(lines)
+        self.assertEqual(parsed.text, "partial")
+        self.assertIsNone(parsed.raw_result)
+        joined_logs = "\n".join(cm.output)
+        self.assertIn("ignored 1 non-text content block", joined_logs)
+        self.assertIn("tool_use", joined_logs)
+
+    def test_no_warning_when_all_blocks_are_text(self):
+        lines = self._lines(
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}], "usage": {}}},
+            {
+                "type": "result", "subtype": "success", "is_error": False,
+                "api_error_status": None, "stop_reason": "end_turn",
+                "result": "hi", "usage": {}, "total_cost_usd": 0.0,
+            },
+        )
+        # No dropped-block warning should be logged when every content item is
+        # text. Capture records directly (assertLogs requires >=1 record, so
+        # it can't assert "none logged"); a plain handler works for that.
+        import logging
+        captured = []
+        handler = logging.Handler()
+        handler.emit = lambda record: captured.append(record.getMessage())
+        target_logger = logging.getLogger("agent.claude_cli_client")
+        target_logger.addHandler(handler)
+        try:
+            parsed = _parse_stream_json_lines(lines)
+        finally:
+            target_logger.removeHandler(handler)
+        self.assertEqual(parsed.text, "hi")
+        self.assertFalse(any("non-text content block" in m for m in captured))
+
+
+class MaxTokensFinishReasonTests(unittest.TestCase):
+    """`finish_reason` reflects `stop_reason == "max_tokens"` as "length" when
+    there are no tool calls; tool-call responses always keep "tool_calls"."""
+
+    def _client(self):
+        return ClaudeCliClient(model="claude-opus-4-8")
+
+    def _max_tokens_result_line(self, text, **usage_kwargs):
+        return json.dumps({
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "api_error_status": None,
+            "stop_reason": "max_tokens",
+            "result": text,
+            "usage": usage_kwargs or {},
+            "total_cost_usd": 0.0,
+        })
+
+    def test_max_tokens_no_tool_calls_yields_length(self):
+        lines = [self._max_tokens_result_line("this got cut off mid-sent")]
+        client = self._client()
+        client._run_claude = MagicMock(return_value=_run(lines))
+        resp = client.chat.completions.create(
+            model="claude-opus-4-8",
+            messages=[{"role": "user", "content": "tell me a long story"}],
+        )
+        self.assertEqual(resp.choices[0].finish_reason, "length")
+        self.assertFalse(resp.choices[0].message.tool_calls)
+
+    def test_max_tokens_with_tool_calls_yields_tool_calls(self):
+        text = '<tool_call>{"name": "read_file", "arguments": "{\\"path\\": \\"/x\\"}"}</tool_call>'
+        lines = [self._max_tokens_result_line(text)]
+        client = self._client()
+        client._run_claude = MagicMock(return_value=_run(lines))
+        resp = client.chat.completions.create(
+            model="claude-opus-4-8",
+            messages=[{"role": "user", "content": "read /x"}],
+        )
+        self.assertEqual(resp.choices[0].finish_reason, "tool_calls")
+
+    def test_end_turn_no_tool_calls_yields_stop(self):
+        lines = [_result_line("a normal complete reply")]
+        client = self._client()
+        client._run_claude = MagicMock(return_value=_run(lines))
+        resp = client.chat.completions.create(
+            model="claude-opus-4-8",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        self.assertEqual(resp.choices[0].finish_reason, "stop")
 
 
 if __name__ == "__main__":
