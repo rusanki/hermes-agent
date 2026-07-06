@@ -317,20 +317,48 @@ def _format_messages_as_prompt(
     return "\n\n".join(section.strip() for section in sections if section and section.strip())
 
 
-def _extract_tool_calls_from_text(text: str) -> tuple[list[SimpleNamespace], str]:
+_MALFORMED_RAW_CAP = 500
+
+# Bare opening tag, used only to detect an unclosed ``<tool_call>`` left over
+# after well-formed blocks have been matched/consumed (the truncated-output
+# signature: output cut off by max_tokens/timeout mid-block).
+_TOOL_CALL_OPEN_TAG_RE = re.compile(r"<tool_call>")
+
+
+def _extract_tool_calls_from_text(
+    text: str,
+) -> tuple[list[SimpleNamespace], str, list[dict[str, str]]]:
+    """Pull ``<tool_call>`` markup out of ``text``.
+
+    Returns ``(extracted, cleaned, malformed)``:
+
+    * ``extracted`` — successfully parsed tool calls, in document order.
+    * ``cleaned`` — ``text`` with only the SUCCESSFULLY parsed blocks' spans
+      removed. A block that fails to parse (bad JSON, non-dict result, missing
+      blank ``name``) is never consumed — its raw markup stays in ``cleaned``
+      so the evidence is never silently deleted.
+    * ``malformed`` — ``[{"raw": <matched block text, capped>, "error": <str>}]``
+      for every block that failed to parse, plus an entry for a trailing
+      unclosed ``<tool_call>`` opening tag with no matching close (the
+      truncated-output signature), in document order.
+    """
+
     if not isinstance(text, str) or not text.strip():
-        return [], ""
+        return [], "", []
 
     extracted: list[SimpleNamespace] = []
+    malformed: list[dict[str, str]] = []
     consumed_spans: list[tuple[int, int]] = []
 
-    def _try_add_tool_call(raw_json: str) -> None:
+    def _try_add_tool_call(raw_json: str) -> str | None:
+        """Attempt to parse+append a tool call. Returns an error string on
+        failure, or ``None`` on success."""
         try:
             obj = json.loads(raw_json)
-        except Exception:
-            return
+        except Exception as exc:
+            return f"invalid JSON: {exc}"
         if not isinstance(obj, dict):
-            return
+            return f"parsed JSON is not an object (got {type(obj).__name__})"
         # Accept both the OpenAI ``function``-wrapped shape and the flat
         # ``{"name", "arguments"}`` shape. The flat shape is what
         # ``_format_messages_as_prompt`` renders into ``<tool_call>`` blocks,
@@ -341,7 +369,7 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[SimpleNamespace], str
             fn = obj
         fn_name = fn.get("name")
         if not isinstance(fn_name, str) or not fn_name.strip():
-            return
+            return "missing or blank \"name\""
         fn_args = fn.get("arguments", "{}")
         if not isinstance(fn_args, str):
             fn_args = json.dumps(fn_args, ensure_ascii=False)
@@ -358,21 +386,50 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[SimpleNamespace], str
                 function=SimpleNamespace(name=fn_name.strip(), arguments=fn_args),
             )
         )
+        return None
 
-    for m in _TOOL_CALL_BLOCK_RE.finditer(text):
+    def _record_malformed(raw: str, error: str) -> None:
+        malformed.append({"raw": raw[:_MALFORMED_RAW_CAP], "error": error})
+
+    block_matches = list(_TOOL_CALL_BLOCK_RE.finditer(text))
+    for m in block_matches:
         raw = m.group(1)
-        _try_add_tool_call(raw)
-        consumed_spans.append((m.start(), m.end()))
+        error = _try_add_tool_call(raw)
+        if error is None:
+            consumed_spans.append((m.start(), m.end()))
+        else:
+            _record_malformed(m.group(0), error)
 
-    # Only try bare-JSON fallback when no XML blocks were found.
-    if not extracted:
+    # Only try bare-JSON fallback when no XML blocks were found at all (valid
+    # or malformed) — a message that used <tool_call> markup, however broken,
+    # should not also be scanned for bare-JSON tool-call-shaped objects.
+    if not block_matches:
         for m in _TOOL_CALL_JSON_RE.finditer(text):
             raw = m.group(0)
-            _try_add_tool_call(raw)
-            consumed_spans.append((m.start(), m.end()))
+            error = _try_add_tool_call(raw)
+            if error is None:
+                consumed_spans.append((m.start(), m.end()))
+            # Bare-JSON fallback matches are heuristic pattern hits, not
+            # explicit <tool_call> markup; a failure here is not reported as
+            # a malformed *block* (there is no tag pair to point to).
+
+    # Unclosed-tag detection: an opening <tool_call> that has no matching
+    # close is the truncated-output signature. Only look at open-tag
+    # occurrences that fall outside every span already matched by the block
+    # regex (a matched block's own opening tag is not "unclosed").
+    matched_block_spans = [(m.start(), m.end()) for m in block_matches]
+
+    def _inside_any_block(pos: int) -> bool:
+        return any(start <= pos < end for start, end in matched_block_spans)
+
+    for m in _TOOL_CALL_OPEN_TAG_RE.finditer(text):
+        if _inside_any_block(m.start()):
+            continue
+        _record_malformed(text[m.start():], "unclosed <tool_call> tag")
+        break  # only the first unclosed tag matters; nothing after it parses
 
     if not consumed_spans:
-        return extracted, text.strip()
+        return extracted, text.strip(), malformed
 
     consumed_spans.sort()
     merged: list[tuple[int, int]] = []
@@ -392,7 +449,7 @@ def _extract_tool_calls_from_text(text: str) -> tuple[list[SimpleNamespace], str
         parts.append(text[cursor:])
 
     cleaned = "\n".join(p.strip() for p in parts if p and p.strip()).strip()
-    return extracted, cleaned
+    return extracted, cleaned, malformed
 
 
 class ClaudeCliError(RuntimeError):
@@ -816,17 +873,46 @@ class ClaudeCliClient:
         finally:
             self._cleanup_image_dir(image_dir)
         parsed = _parse_stream_json_lines(lines)
-        tool_calls, cleaned = _extract_tool_calls_from_text(parsed.text)
+        tool_calls, cleaned, malformed = _extract_tool_calls_from_text(parsed.text)
+
+        extra_usage: dict[str, Any] | None = None
+        if malformed:
+            logger.warning(
+                "claude-cli: %d malformed <tool_call> block(s): %s; first block: %.200s",
+                len(malformed),
+                [m["error"] for m in malformed],
+                malformed[0]["raw"],
+            )
+            if not tool_calls:
+                # Exactly one repair attempt: ask the model to re-emit its
+                # reply with valid <tool_call> markup, never recursing on the
+                # retry's own result (max 2 subprocess runs total).
+                retry_tool_calls, retry_cleaned, retry_parsed = self._attempt_repair(
+                    prompt, sys_prompt, eff_model, timeout, parsed.text, malformed[0]["error"],
+                )
+                if retry_tool_calls:
+                    tool_calls, cleaned = retry_tool_calls, retry_cleaned
+                    extra_usage = retry_parsed.usage
+                else:
+                    logger.warning(
+                        "claude-cli: repair attempt failed to produce a valid "
+                        "tool call; delivering original text"
+                    )
+                    # Fall back to the ORIGINAL parsed/cleaned result — the
+                    # malformed block(s) stay visible in `cleaned` already.
 
         prompt_tokens = parsed.usage.get("input_tokens", 0)
         completion_tokens = parsed.usage.get("output_tokens", 0)
+        cached_tokens = parsed.usage.get("cache_read_input_tokens", 0)
+        if extra_usage:
+            prompt_tokens += extra_usage.get("input_tokens", 0)
+            completion_tokens += extra_usage.get("output_tokens", 0)
+            cached_tokens += extra_usage.get("cache_read_input_tokens", 0)
         usage = SimpleNamespace(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
-            prompt_tokens_details=SimpleNamespace(
-                cached_tokens=parsed.usage.get("cache_read_input_tokens", 0)
-            ),
+            prompt_tokens_details=SimpleNamespace(cached_tokens=cached_tokens),
         )
         assistant_message = SimpleNamespace(
             content=cleaned,
@@ -838,6 +924,41 @@ class ClaudeCliClient:
         finish_reason = "tool_calls" if tool_calls else "stop"
         choice = SimpleNamespace(message=assistant_message, finish_reason=finish_reason)
         return SimpleNamespace(choices=[choice], usage=usage, model=eff_model)
+
+    def _attempt_repair(
+        self,
+        prompt: str,
+        sys_prompt: str,
+        eff_model: str,
+        timeout: float | None,
+        original_text: str,
+        first_error: str,
+    ) -> tuple[list[SimpleNamespace], str, SimpleNamespace]:
+        """Run exactly one repair retry after a malformed-only reply.
+
+        Re-prompts the model with its own previous (malformed) reply and asks
+        it to re-emit valid ``<tool_call>`` markup. The retry's own result is
+        never repaired again, so this performs at most one extra subprocess
+        run (no recursion).
+        """
+
+        repair_prompt = (
+            prompt
+            + "\n\nAssistant: " + original_text
+            + "\n\nUser: Your previous reply contained a malformed <tool_call> "
+            "block (error: " + first_error + "). Re-emit your reply now with "
+            "each tool call as exactly one valid JSON object inside "
+            "<tool_call></tool_call> tags. Do not describe an action in prose "
+            "without emitting its <tool_call>."
+        )
+        retry_lines = self._run_claude(
+            repair_prompt, sys_prompt, eff_model, timeout, image_dir=None,
+        )
+        retry_parsed = _parse_stream_json_lines(retry_lines)
+        retry_tool_calls, retry_cleaned, _retry_malformed = _extract_tool_calls_from_text(
+            retry_parsed.text
+        )
+        return retry_tool_calls, retry_cleaned, retry_parsed
 
     def _run_claude(
         self,

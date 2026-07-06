@@ -59,15 +59,17 @@ class FormatterTests(unittest.TestCase):
 
     def test_extract_single_tool_call(self):
         text = '<tool_call>{"name": "read_file", "arguments": "{\\"path\\": \\"/x\\"}"}</tool_call>'
-        calls, cleaned = _extract_tool_calls_from_text(text)
+        calls, cleaned, malformed = _extract_tool_calls_from_text(text)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].function.name, "read_file")
         self.assertEqual(cleaned, "")
+        self.assertEqual(malformed, [])
 
     def test_extract_text_only_no_calls(self):
-        calls, cleaned = _extract_tool_calls_from_text("just text")
+        calls, cleaned, malformed = _extract_tool_calls_from_text("just text")
         self.assertEqual(calls, [])
         self.assertEqual(cleaned, "just text")
+        self.assertEqual(malformed, [])
 
     def test_render_extract_roundtrip(self):
         # An assistant tool_call (args as a JSON string) rendered into a prompt
@@ -77,7 +79,7 @@ class FormatterTests(unittest.TestCase):
             {"id": "c1", "type": "function",
              "function": {"name": "read_file", "arguments": '{"path":"/x"}'}}]}]
         prompt = _format_messages_as_prompt(msgs, model=None, tools=None)
-        calls, _ = _extract_tool_calls_from_text(prompt)
+        calls, _, _malformed = _extract_tool_calls_from_text(prompt)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].function.name, "read_file")
         self.assertEqual(json.loads(calls[0].function.arguments), {"path": "/x"})
@@ -108,14 +110,115 @@ class FormatterTests(unittest.TestCase):
         self.assertIn("<tool_call>", prompt)
         self.assertIn("read_file", prompt)
 
-    def test_malformed_tool_call_json_is_dropped_but_consumed(self):
-        # A malformed <tool_call> block yields zero calls, but the block is
-        # still stripped from the cleaned text while surrounding text survives.
+    def test_malformed_tool_call_json_is_reported_and_left_visible(self):
+        # A malformed <tool_call> block yields zero calls, is reported in
+        # `malformed` with an error string, and is NEVER deleted from the
+        # cleaned text — the raw block must stay visible (never silently
+        # discarded), while surrounding text also survives.
         text = "<tool_call>{not valid json}</tool_call> trailing"
-        calls, cleaned = _extract_tool_calls_from_text(text)
+        calls, cleaned, malformed = _extract_tool_calls_from_text(text)
         self.assertEqual(calls, [])
         self.assertIn("trailing", cleaned)
-        self.assertNotIn("not valid json", cleaned)
+        self.assertIn("not valid json", cleaned)
+        self.assertEqual(len(malformed), 1)
+        self.assertIn("not valid json", malformed[0]["raw"])
+        self.assertTrue(malformed[0]["error"])
+
+    def test_malformed_and_valid_blocks_in_same_text(self):
+        # A malformed block alongside a valid one: the valid block is still
+        # extracted and stripped from cleaned text, while the malformed block
+        # is reported AND stays visible in cleaned text.
+        text = (
+            "Before.\n"
+            "<tool_call>{not valid json}</tool_call>\n"
+            'adapter <tool_call>{"name": "read_file", "arguments": "{\\"path\\": \\"/x\\"}"}</tool_call>\n'
+            "After."
+        )
+        calls, cleaned, malformed = _extract_tool_calls_from_text(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].function.name, "read_file")
+        self.assertEqual(len(malformed), 1)
+        self.assertIn("not valid json", malformed[0]["raw"])
+        self.assertIn("not valid json", cleaned)
+        self.assertIn("Before.", cleaned)
+        self.assertIn("After.", cleaned)
+        # The valid block's markup must be gone; the malformed block's must
+        # remain (it is not consumed).
+        self.assertNotIn("read_file", cleaned)
+
+    def test_malformed_json_error_string_is_descriptive(self):
+        # The error string must describe the JSON failure, not be empty/generic.
+        text = "<tool_call>{not valid json}</tool_call>"
+        _, _, malformed = _extract_tool_calls_from_text(text)
+        self.assertEqual(len(malformed), 1)
+        self.assertIsInstance(malformed[0]["error"], str)
+        self.assertGreater(len(malformed[0]["error"]), 0)
+
+    def test_malformed_non_dict_json_result_reported(self):
+        # Valid JSON that parses to a non-dict (e.g. a bare list) must be
+        # reported as malformed, not silently ignored.
+        text = "<tool_call>[1, 2, 3]</tool_call>"
+        calls, cleaned, malformed = _extract_tool_calls_from_text(text)
+        self.assertEqual(calls, [])
+        self.assertEqual(len(malformed), 1)
+        self.assertIn("[1, 2, 3]", cleaned)
+
+    def test_malformed_missing_name_reported(self):
+        # Valid JSON dict but missing/blank "name" must be reported as
+        # malformed and left visible.
+        text = '<tool_call>{"arguments": "{}"}</tool_call>'
+        calls, cleaned, malformed = _extract_tool_calls_from_text(text)
+        self.assertEqual(calls, [])
+        self.assertEqual(len(malformed), 1)
+        self.assertIn("arguments", cleaned)
+
+    def test_malformed_blank_name_reported(self):
+        text = '<tool_call>{"name": "  ", "arguments": "{}"}</tool_call>'
+        calls, cleaned, malformed = _extract_tool_calls_from_text(text)
+        self.assertEqual(calls, [])
+        self.assertEqual(len(malformed), 1)
+
+    def test_malformed_literal_control_char_in_json_string(self):
+        # A literal newline (raw control char, not the two-char escape "\n")
+        # embedded in a JSON string value: json.loads must reject this, and it
+        # must be reported as malformed rather than silently dropped.
+        text = '<tool_call>{"name": "write_file", "arguments": "{\\"content\\": \\"line1\nline2\\"}"}</tool_call>'
+        calls, cleaned, malformed = _extract_tool_calls_from_text(text)
+        self.assertEqual(calls, [])
+        self.assertEqual(len(malformed), 1)
+        self.assertIn("write_file", cleaned)
+
+    def test_unclosed_tool_call_tag_detected(self):
+        # Output truncated mid-block (max_tokens/timeout): an opening
+        # <tool_call> with no matching closing tag must be reported as
+        # malformed with a specific error, and left visible (not consumed).
+        text = 'Sure, one sec.\n<tool_call>{"name": "cronjob", "argu'
+        calls, cleaned, malformed = _extract_tool_calls_from_text(text)
+        self.assertEqual(calls, [])
+        self.assertEqual(len(malformed), 1)
+        self.assertEqual(malformed[0]["error"], "unclosed <tool_call> tag")
+        self.assertIn("cronjob", malformed[0]["raw"])
+        self.assertIn("Sure, one sec.", cleaned)
+        self.assertIn("<tool_call>", cleaned)
+
+    def test_unclosed_tag_raw_capped_at_500_chars(self):
+        text = "<tool_call>" + ("x" * 1000)
+        _, _, malformed = _extract_tool_calls_from_text(text)
+        self.assertEqual(len(malformed), 1)
+        self.assertLessEqual(len(malformed[0]["raw"]), 500)
+
+    def test_malformed_block_raw_capped_at_500_chars(self):
+        # A malformed (parse-failing) block's raw text is capped at 500 chars.
+        text = "<tool_call>{not valid json " + ("x" * 1000) + "}</tool_call>"
+        _, _, malformed = _extract_tool_calls_from_text(text)
+        self.assertEqual(len(malformed), 1)
+        self.assertLessEqual(len(malformed[0]["raw"]), 500)
+
+    def test_no_unclosed_tag_false_positive_when_all_blocks_closed(self):
+        # A normal closed block must NOT trigger unclosed-tag detection.
+        text = '<tool_call>{"name": "read_file", "arguments": "{}"}</tool_call>'
+        _, _, malformed = _extract_tool_calls_from_text(text)
+        self.assertEqual(malformed, [])
 
     def test_extract_tool_call_with_nested_brace_arguments_object(self):
         # Regression guard: full nested-brace payloads must extract intact
@@ -128,7 +231,7 @@ class FormatterTests(unittest.TestCase):
             '<tool_call>{"name":"cronjob","arguments":{"action":"create",'
             '"job":{"schedule":"0 9 * * *","name":"digest"}}}</tool_call>'
         )
-        calls, cleaned = _extract_tool_calls_from_text(text)
+        calls, cleaned, malformed = _extract_tool_calls_from_text(text)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].function.name, "cronjob")
         # function.arguments is stringified in `_try_add_tool_call` since the
@@ -138,6 +241,7 @@ class FormatterTests(unittest.TestCase):
             {"action": "create", "job": {"schedule": "0 9 * * *", "name": "digest"}},
         )
         self.assertEqual(cleaned, "")
+        self.assertEqual(malformed, [])
 
     def test_extract_tool_call_with_escaped_braces_in_argument_string(self):
         # "arguments" as a JSON string whose contents themselves contain
@@ -147,7 +251,7 @@ class FormatterTests(unittest.TestCase):
             '"arguments": "{\\"path\\": \\"/tmp/x\\", '
             '\\"content\\": \\"if (a) { b(); }\\"}"}</tool_call>'
         )
-        calls, cleaned = _extract_tool_calls_from_text(text)
+        calls, cleaned, malformed = _extract_tool_calls_from_text(text)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].function.name, "write_file")
         self.assertEqual(
@@ -155,6 +259,7 @@ class FormatterTests(unittest.TestCase):
             {"path": "/tmp/x", "content": "if (a) { b(); }"},
         )
         self.assertEqual(cleaned, "")
+        self.assertEqual(malformed, [])
 
     def test_extract_pretty_printed_multiline_tool_call(self):
         # Pretty-printed JSON (newlines/indentation, nested object) inside the
@@ -172,7 +277,7 @@ class FormatterTests(unittest.TestCase):
             "}\n"
             "</tool_call>"
         )
-        calls, cleaned = _extract_tool_calls_from_text(text)
+        calls, cleaned, malformed = _extract_tool_calls_from_text(text)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].function.name, "cronjob")
         self.assertEqual(
@@ -180,6 +285,7 @@ class FormatterTests(unittest.TestCase):
             {"action": "create", "job": {"schedule": "0 9 * * *"}},
         )
         self.assertEqual(cleaned, "")
+        self.assertEqual(malformed, [])
 
     def test_two_nested_brace_tool_calls_with_surrounding_prose(self):
         # Two nested-brace blocks in one message, with prose before/between/
@@ -194,10 +300,11 @@ class FormatterTests(unittest.TestCase):
             '"job":{"id":"abc"}}}</tool_call>\n'
             "Done."
         )
-        calls, cleaned = _extract_tool_calls_from_text(text)
+        calls, cleaned, malformed = _extract_tool_calls_from_text(text)
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0].function.name, "cronjob")
         self.assertEqual(calls[1].function.name, "cronjob")
+        self.assertEqual(malformed, [])
         self.assertEqual(
             json.loads(calls[0].function.arguments)["action"], "create"
         )
@@ -410,6 +517,153 @@ class ClientFacadeTests(unittest.TestCase):
             # ANTHROPIC_TOKEN is Hermes-managed OAuth and must be left intact.
             self.assertEqual(env.get("ANTHROPIC_TOKEN"), "hermes-managed-oauth-keep-me")
             self.assertIn("HOME", env)
+
+
+def _result_line(text, input_tokens=0, output_tokens=0, cache_read=0):
+    return json.dumps({
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "api_error_status": None,
+        "stop_reason": "end_turn",
+        "result": text,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_read_input_tokens": cache_read,
+        },
+        "total_cost_usd": 0.0,
+    })
+
+
+class RepairRetryTests(unittest.TestCase):
+    """Malformed <tool_call> blocks trigger exactly one repair retry attempt.
+
+    ``_run_claude`` is mocked with a side_effect list so each call in the
+    sequence returns fixture stream-json stdout lines; invocation count is
+    asserted directly on the mock.
+    """
+
+    def _client(self):
+        return ClaudeCliClient(model="claude-opus-4-8")
+
+    def test_malformed_only_then_valid_repair_uses_retry_result(self):
+        # A block with a literal (raw) newline control char inside a JSON
+        # string value: json.loads rejects this. No valid calls on the first
+        # attempt -> exactly one repair retry -> retry succeeds.
+        original_text = (
+            'Sure, I will do that now.\n'
+            '<tool_call>{"name": "write_file", "arguments": '
+            '"{\\"content\\": \\"line1\nline2\\"}"}</tool_call>'
+        )
+        retry_text = '<tool_call>{"name": "write_file", "arguments": "{\\"content\\": \\"line1 line2\\"}"}</tool_call>'
+        first_lines = [_result_line(original_text, input_tokens=10, output_tokens=20, cache_read=1)]
+        second_lines = [_result_line(retry_text, input_tokens=5, output_tokens=7, cache_read=2)]
+
+        client = self._client()
+        mock_run = MagicMock(side_effect=[first_lines, second_lines])
+        client._run_claude = mock_run
+
+        resp = client.chat.completions.create(
+            model="claude-opus-4-8",
+            messages=[{"role": "user", "content": "write something"}],
+        )
+
+        self.assertEqual(mock_run.call_count, 2)
+        # The second call's prompt must contain the original assistant text
+        # and the correction sentence.
+        second_call_prompt = mock_run.call_args_list[1].args[0]
+        self.assertIn("Sure, I will do that now.", second_call_prompt)
+        self.assertIn("malformed <tool_call>", second_call_prompt)
+
+        self.assertEqual(resp.choices[0].finish_reason, "tool_calls")
+        self.assertEqual(resp.choices[0].message.tool_calls[0].function.name, "write_file")
+        # Usage tokens must be summed across both runs.
+        self.assertEqual(resp.usage.prompt_tokens, 15)
+        self.assertEqual(resp.usage.completion_tokens, 27)
+        self.assertEqual(resp.usage.prompt_tokens_details.cached_tokens, 3)
+
+    def test_malformed_only_retry_also_malformed_falls_back_to_original(self):
+        original_text = "I've made the change.\n<tool_call>{not valid json}</tool_call>"
+        retry_text = "Still broken.\n<tool_call>{also not valid}</tool_call>"
+        first_lines = [_result_line(original_text)]
+        second_lines = [_result_line(retry_text)]
+
+        client = self._client()
+        mock_run = MagicMock(side_effect=[first_lines, second_lines])
+        client._run_claude = mock_run
+
+        with self.assertLogs("agent.claude_cli_client", level="WARNING") as cm:
+            resp = client.chat.completions.create(
+                model="claude-opus-4-8",
+                messages=[{"role": "user", "content": "do something"}],
+            )
+
+        self.assertEqual(mock_run.call_count, 2)
+        self.assertEqual(resp.choices[0].finish_reason, "stop")
+        # The RAW malformed block text from the ORIGINAL reply must be visible.
+        self.assertIn("not valid json", resp.choices[0].message.content)
+        self.assertFalse(resp.choices[0].message.tool_calls)
+        # Both the malformed-block warning and the repair-failed warning fire.
+        joined_logs = "\n".join(cm.output)
+        self.assertIn("malformed", joined_logs.lower())
+        self.assertIn("repair attempt failed", joined_logs.lower())
+
+    def test_malformed_and_valid_mixed_no_repair_run(self):
+        text = (
+            "Partial success.\n"
+            "<tool_call>{not valid json}</tool_call>\n"
+            '<tool_call>{"name": "read_file", "arguments": "{\\"path\\": \\"/x\\"}"}</tool_call>'
+        )
+        lines = [_result_line(text)]
+        client = self._client()
+        mock_run = MagicMock(side_effect=[lines])
+        client._run_claude = mock_run
+
+        with self.assertLogs("agent.claude_cli_client", level="WARNING"):
+            resp = client.chat.completions.create(
+                model="claude-opus-4-8",
+                messages=[{"role": "user", "content": "do two things"}],
+            )
+
+        self.assertEqual(mock_run.call_count, 1)
+        self.assertEqual(resp.choices[0].finish_reason, "tool_calls")
+        self.assertEqual(resp.choices[0].message.tool_calls[0].function.name, "read_file")
+        self.assertIn("not valid json", resp.choices[0].message.content)
+
+    def test_no_malformed_no_repair_run(self):
+        lines = [_result_line("just a normal reply", input_tokens=3, output_tokens=4)]
+        client = self._client()
+        mock_run = MagicMock(side_effect=[lines])
+        client._run_claude = mock_run
+
+        resp = client.chat.completions.create(
+            model="claude-opus-4-8",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+
+        self.assertEqual(mock_run.call_count, 1)
+        self.assertEqual(resp.choices[0].finish_reason, "stop")
+        self.assertEqual(resp.choices[0].message.content, "just a normal reply")
+
+    def test_unclosed_tag_triggers_repair(self):
+        original_text = 'One moment.\n<tool_call>{"name": "cronjob", "argu'
+        retry_text = '<tool_call>{"name": "cronjob", "arguments": "{\\"action\\": \\"list\\"}"}</tool_call>'
+        first_lines = [_result_line(original_text)]
+        second_lines = [_result_line(retry_text)]
+
+        client = self._client()
+        mock_run = MagicMock(side_effect=[first_lines, second_lines])
+        client._run_claude = mock_run
+
+        resp = client.chat.completions.create(
+            model="claude-opus-4-8",
+            messages=[{"role": "user", "content": "list my jobs"}],
+        )
+
+        self.assertEqual(mock_run.call_count, 2)
+        self.assertEqual(resp.choices[0].finish_reason, "tool_calls")
+        self.assertEqual(resp.choices[0].message.tool_calls[0].function.name, "cronjob")
 
 
 class ClientAwaitableCreateTests(unittest.TestCase):
