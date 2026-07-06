@@ -564,10 +564,11 @@ class RepairRetryTests(unittest.TestCase):
         mock_run = MagicMock(side_effect=[first_lines, second_lines])
         client._run_claude = mock_run
 
-        resp = client.chat.completions.create(
-            model="claude-opus-4-8",
-            messages=[{"role": "user", "content": "write something"}],
-        )
+        with self.assertLogs("agent.claude_cli_client", level="INFO") as cm:
+            resp = client.chat.completions.create(
+                model="claude-opus-4-8",
+                messages=[{"role": "user", "content": "write something"}],
+            )
 
         self.assertEqual(mock_run.call_count, 2)
         # The second call's prompt must contain the original assistant text
@@ -575,6 +576,8 @@ class RepairRetryTests(unittest.TestCase):
         second_call_prompt = mock_run.call_args_list[1].args[0]
         self.assertIn("Sure, I will do that now.", second_call_prompt)
         self.assertIn("malformed <tool_call>", second_call_prompt)
+        # Success is logged at INFO level.
+        self.assertIn("repair retry succeeded", "\n".join(cm.output))
 
         self.assertEqual(resp.choices[0].finish_reason, "tool_calls")
         self.assertEqual(resp.choices[0].message.tool_calls[0].function.name, "write_file")
@@ -586,8 +589,8 @@ class RepairRetryTests(unittest.TestCase):
     def test_malformed_only_retry_also_malformed_falls_back_to_original(self):
         original_text = "I've made the change.\n<tool_call>{not valid json}</tool_call>"
         retry_text = "Still broken.\n<tool_call>{also not valid}</tool_call>"
-        first_lines = [_result_line(original_text)]
-        second_lines = [_result_line(retry_text)]
+        first_lines = [_result_line(original_text, input_tokens=10, output_tokens=20, cache_read=1)]
+        second_lines = [_result_line(retry_text, input_tokens=5, output_tokens=7, cache_read=2)]
 
         client = self._client()
         mock_run = MagicMock(side_effect=[first_lines, second_lines])
@@ -608,6 +611,72 @@ class RepairRetryTests(unittest.TestCase):
         joined_logs = "\n".join(cm.output)
         self.assertIn("malformed", joined_logs.lower())
         self.assertIn("repair attempt failed", joined_logs.lower())
+        # Retry tokens are real cost: usage is summed even on a failed repair.
+        self.assertEqual(resp.usage.prompt_tokens, 15)
+        self.assertEqual(resp.usage.completion_tokens, 27)
+        self.assertEqual(resp.usage.prompt_tokens_details.cached_tokens, 3)
+
+    def test_repair_run_exception_falls_back_to_original(self):
+        # A repair run that raises (e.g. subprocess timeout) must never
+        # destroy the original result: no exception propagates, the original
+        # text (raw malformed block visible) is delivered, and the raised
+        # warning is logged.
+        original_text = "Done!\n<tool_call>{not valid json}</tool_call>"
+        first_lines = [_result_line(original_text, input_tokens=10, output_tokens=20)]
+
+        client = self._client()
+        mock_run = MagicMock(side_effect=[first_lines, ClaudeCliError("timeout")])
+        client._run_claude = mock_run
+
+        with self.assertLogs("agent.claude_cli_client", level="WARNING") as cm:
+            resp = client.chat.completions.create(
+                model="claude-opus-4-8",
+                messages=[{"role": "user", "content": "do something"}],
+            )
+
+        self.assertEqual(mock_run.call_count, 2)
+        self.assertEqual(resp.choices[0].finish_reason, "stop")
+        self.assertIn("not valid json", resp.choices[0].message.content)
+        self.assertFalse(resp.choices[0].message.tool_calls)
+        # Only the original run's usage is counted (the raising run returned
+        # no parseable usage).
+        self.assertEqual(resp.usage.prompt_tokens, 10)
+        self.assertEqual(resp.usage.completion_tokens, 20)
+        joined_logs = "\n".join(cm.output)
+        self.assertIn("repair attempt raised", joined_logs)
+        self.assertIn("timeout", joined_logs)
+
+    def test_image_turn_malformed_skips_repair(self):
+        # An image-bearing turn must NOT attempt repair: the image scratch dir
+        # is already cleaned up and the repair run has tools disabled, so the
+        # retry model would be told to Read a file it can't access. The
+        # original fallback is delivered after exactly one subprocess run.
+        original_text = "I see the image.\n<tool_call>{not valid json}</tool_call>"
+        first_lines = [_result_line(original_text)]
+
+        client = self._client()
+        mock_run = MagicMock(side_effect=[first_lines])
+        client._run_claude = mock_run
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe and act"},
+                    {"type": "image_url", "image_url": {"url": _PNG_1PX_DATA_URL}},
+                ],
+            }
+        ]
+        with self.assertLogs("agent.claude_cli_client", level="WARNING") as cm:
+            resp = client.chat.completions.create(
+                model="claude-opus-4-8", messages=messages,
+            )
+
+        self.assertEqual(mock_run.call_count, 1)
+        self.assertEqual(resp.choices[0].finish_reason, "stop")
+        self.assertIn("not valid json", resp.choices[0].message.content)
+        joined_logs = "\n".join(cm.output)
+        self.assertIn("skipping repair retry for image-bearing turn", joined_logs)
 
     def test_malformed_and_valid_mixed_no_repair_run(self):
         text = (

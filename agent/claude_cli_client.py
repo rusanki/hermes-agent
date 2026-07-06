@@ -417,6 +417,10 @@ def _extract_tool_calls_from_text(
     # close is the truncated-output signature. Only look at open-tag
     # occurrences that fall outside every span already matched by the block
     # regex (a matched block's own opening tag is not "unclosed").
+    # Document order of `malformed` holds with this entry appended last: an
+    # unmatched open tag can never precede a later ``</tool_call>`` — the
+    # block regex would have consumed it — so any unclosed tag necessarily
+    # lies after every matched (valid or malformed) block.
     matched_block_spans = [(m.start(), m.end()) for m in block_matches]
 
     def _inside_any_block(pos: int) -> bool:
@@ -425,7 +429,10 @@ def _extract_tool_calls_from_text(
     for m in _TOOL_CALL_OPEN_TAG_RE.finditer(text):
         if _inside_any_block(m.start()):
             continue
-        _record_malformed(text[m.start():], "unclosed <tool_call> tag")
+        _record_malformed(
+            text[m.start():m.start() + _MALFORMED_RAW_CAP],
+            "unclosed <tool_call> tag",
+        )
         break  # only the first unclosed tag matters; nothing after it parses
 
     if not consumed_spans:
@@ -884,22 +891,52 @@ class ClaudeCliClient:
                 malformed[0]["raw"],
             )
             if not tool_calls:
-                # Exactly one repair attempt: ask the model to re-emit its
-                # reply with valid <tool_call> markup, never recursing on the
-                # retry's own result (max 2 subprocess runs total).
-                retry_tool_calls, retry_cleaned, retry_parsed = self._attempt_repair(
-                    prompt, sys_prompt, eff_model, timeout, parsed.text, malformed[0]["error"],
-                )
-                if retry_tool_calls:
-                    tool_calls, cleaned = retry_tool_calls, retry_cleaned
-                    extra_usage = retry_parsed.usage
-                else:
+                if image_paths:
+                    # No repair for image-bearing turns: the per-call image
+                    # scratch dir is already cleaned up above, and the repair
+                    # run executes with tools disabled — the retry model would
+                    # be told to Read a file it can no longer access.
                     logger.warning(
-                        "claude-cli: repair attempt failed to produce a valid "
-                        "tool call; delivering original text"
+                        "claude-cli: skipping repair retry for image-bearing turn"
                     )
-                    # Fall back to the ORIGINAL parsed/cleaned result — the
-                    # malformed block(s) stay visible in `cleaned` already.
+                else:
+                    # Exactly one repair attempt: ask the model to re-emit its
+                    # reply with valid <tool_call> markup, never recursing on
+                    # the retry's own result (max 2 subprocess runs total).
+                    try:
+                        retry_tool_calls, retry_cleaned, retry_usage = (
+                            self._attempt_repair(
+                                prompt, sys_prompt, eff_model, timeout,
+                                parsed.text, malformed[0]["error"],
+                            )
+                        )
+                    except Exception as exc:
+                        # A repair-run failure must never destroy the original
+                        # result — fall through to the original-text fallback.
+                        logger.warning(
+                            "claude-cli: repair attempt raised %s; "
+                            "delivering original text",
+                            exc,
+                        )
+                    else:
+                        # Retry tokens are real cost: sum usage whenever the
+                        # retry ran, even if it failed to produce a valid call.
+                        extra_usage = retry_usage
+                        if retry_tool_calls:
+                            tool_calls, cleaned = retry_tool_calls, retry_cleaned
+                            logger.info(
+                                "claude-cli: repair retry succeeded with %d "
+                                "tool call(s)",
+                                len(tool_calls),
+                            )
+                        else:
+                            logger.warning(
+                                "claude-cli: repair attempt failed to produce "
+                                "a valid tool call; delivering original text"
+                            )
+                            # Fall back to the ORIGINAL parsed/cleaned result —
+                            # the malformed block(s) stay visible in `cleaned`
+                            # already.
 
         prompt_tokens = parsed.usage.get("input_tokens", 0)
         completion_tokens = parsed.usage.get("output_tokens", 0)
@@ -933,13 +970,18 @@ class ClaudeCliClient:
         timeout: float | None,
         original_text: str,
         first_error: str,
-    ) -> tuple[list[SimpleNamespace], str, SimpleNamespace]:
+    ) -> tuple[list[SimpleNamespace], str, dict[str, Any]]:
         """Run exactly one repair retry after a malformed-only reply.
 
         Re-prompts the model with its own previous (malformed) reply and asks
         it to re-emit valid ``<tool_call>`` markup. The retry's own result is
         never repaired again, so this performs at most one extra subprocess
         run (no recursion).
+
+        Returns ``(tool_calls, cleaned, usage)`` — ``usage`` is the retry
+        run's raw usage dict, which the caller must sum into the response
+        usage regardless of whether the retry produced a valid call (retry
+        tokens are real cost either way).
         """
 
         repair_prompt = (
@@ -958,7 +1000,7 @@ class ClaudeCliClient:
         retry_tool_calls, retry_cleaned, _retry_malformed = _extract_tool_calls_from_text(
             retry_parsed.text
         )
-        return retry_tool_calls, retry_cleaned, retry_parsed
+        return retry_tool_calls, retry_cleaned, retry_parsed.usage
 
     def _run_claude(
         self,
