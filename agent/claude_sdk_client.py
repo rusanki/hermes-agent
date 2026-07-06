@@ -211,3 +211,97 @@ def _get_bridge() -> _BridgeLoop:
         if _BRIDGE is None:
             _BRIDGE = _BridgeLoop()
         return _BRIDGE
+
+
+# ---------------------------------------------------------------------------
+# Task 6: history reconciliation (pure logic — no SDK calls, threads, or RBAC).
+#
+# The SDK owns its own conversation server-side, so on each Hermes ``create()``
+# we must NOT re-send the whole transcript (that would double history and blow
+# the context window). Instead we send only the new user message(s). But if
+# Hermes rewrote/compressed/restarted history (a real event), the live SDK
+# session is out of sync and we must reseed a FRESH session from the rendered
+# history. ``reconcile`` is the state machine that distinguishes those cases:
+#   * false "reseed" on a normal turn  -> throws away the live session (costly)
+#   * false "no reseed" on a rewrite   -> corrupts the conversation
+# Both guards matter; both have dedicated tests.
+# ---------------------------------------------------------------------------
+from dataclasses import dataclass, field
+
+
+@dataclass
+class _ReconcileDecision:
+    reseed: bool
+    new_messages: list = field(default_factory=list)
+    reseed_reason: str = ""
+
+
+def _strip_system(messages: list) -> list:
+    return [m for m in (messages or []) if m.get("role") != "system"]
+
+
+@dataclass
+class _SdkSession:
+    session_id: str
+    shadow: list = field(default_factory=list)   # non-system OpenAI messages fed so far
+    sdk_client: object | None = None             # live ClaudeSDKClient (Task 7)
+
+    # SHADOW-UPDATE STRATEGY (for Task 7 — do NOT "fix" reconcile to compensate):
+    # The shadow list mirrors BOTH roles the live SDK session already knows about
+    # (system prompts are stripped — they are applied via ``ClaudeAgentOptions``,
+    # not as conversation turns). After each successful turn, Task 7's caller MUST
+    # append to ``shadow`` the sent user message(s) AND the assistant final text as
+    # ``{"role": "assistant", "content": <text>}``. That is why the normal-turn
+    # test pre-seeds shadow with ``[u1, a1]``: the next incoming's ``[u1, a1]``
+    # prefix then matches, and only the trailing new user message is detected as
+    # ``new_messages``. Keeping the shadow in lock-step with what the SDK has seen
+    # is what makes the cheap prefix check correct — the reconcile logic stays
+    # pure and must not be patched to paper over a shadow-update omission.
+
+    def reconcile(self, incoming: list) -> _ReconcileDecision:
+        """Compare incoming (system stripped) against the shadow list.
+
+        Match  = shadow is a prefix of incoming_nonsys AND the only new trailing
+                 entries are appendable (the previous assistant text the SDK
+                 already produced + the new user message). We send only the
+                 messages after the shadow prefix that are NEW user turns.
+        Mismatch = shadow is NOT a prefix (compression/rewrite/restart/switch) =>
+                 reseed from rendered history.
+        """
+        incoming_nonsys = _strip_system(incoming)
+
+        # Empty-shadow guard (fresh process / new session object). A naive prefix
+        # check would treat ``shadow == incoming_nonsys[:0]`` as ``[] == []`` -> a
+        # spurious match. But an empty shadow paired with pre-existing history
+        # (any assistant turn, or more than one message) means the incoming carries
+        # a transcript this fresh SDK session has NEVER seen -> we MUST reseed. Only
+        # a brand-new conversation (exactly one user message, no assistant history)
+        # is a legitimate first turn that appends without reseeding.
+        if not self.shadow:
+            has_prior_history = (
+                len(incoming_nonsys) > 1
+                or any(m.get("role") == "assistant" for m in incoming_nonsys)
+            )
+            if has_prior_history:
+                return _ReconcileDecision(reseed=True, reseed_reason="restart-no-shadow")
+            # Fresh first turn: fall through to the append path below, which
+            # returns the single new user message as new_messages.
+
+        n = len(self.shadow)
+        if self.shadow != incoming_nonsys[:n]:
+            reason = ("restart-no-shadow" if not self.shadow
+                      else "history-rewritten")
+            return _ReconcileDecision(reseed=True, reseed_reason=reason)
+        # Prefix matches. The tail beyond the shadow is what the SDK hasn't seen.
+        tail = incoming_nonsys[n:]
+        # The SDK session already contains the assistant reply it produced, so only
+        # NEW user messages in the tail need sending.
+        new_user = [m for m in tail if m.get("role") == "user"]
+        return _ReconcileDecision(reseed=False, new_messages=new_user)
+
+
+def _render_history_for_reseed(messages: list, model: str, tools: list) -> str:
+    """Render prior history as one synthetic first user message on a fresh SDK
+    session. Reuse claude-cli's renderer so there's no new rendering code."""
+    from agent.claude_cli_client import _format_messages_as_prompt
+    return _format_messages_as_prompt(messages, model, tools, None)
