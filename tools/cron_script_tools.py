@@ -14,6 +14,7 @@ sha256 verification, fail-closed reads — lives in ``cron.script_registry``.
 """
 from cron import script_registry
 from gateway.session_context import get_session_user_id
+from tools.cronjob_tools import check_cronjob_requirements
 from tools.registry import registry, tool_error, tool_result
 
 
@@ -154,6 +155,7 @@ registry.register(
         content=args.get("content"),
         task_id=kw.get("task_id"),
     ),
+    check_fn=check_cronjob_requirements,  # gate on session context, same as `cronjob`
     emoji="📝",
 )
 
@@ -167,5 +169,6 @@ registry.register(
         sha256=args.get("sha256"),
         task_id=kw.get("task_id"),
     ),
+    check_fn=check_cronjob_requirements,  # gate on session context, same as `cronjob`
     emoji="✅",
 )
