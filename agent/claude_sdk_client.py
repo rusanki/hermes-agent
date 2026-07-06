@@ -27,8 +27,10 @@ Sibling of ``agent/claude_cli_client.py``; that file is untouched (rollback lane
 """
 from __future__ import annotations
 
-import os
+import asyncio
 import logging
+import os
+import threading
 from types import SimpleNamespace  # noqa: F401  (re-exported for test/consumer parity)
 from typing import Any
 
@@ -166,3 +168,46 @@ class ClaudeSdkClient:
 
     def close(self) -> None:
         self.is_closed = True
+
+
+class _BridgeLoop:
+    """One daemon-thread asyncio event loop shared by all SDK clients.
+
+    Mirrors the daemon-loop pattern in tools/mcp_tool.py. Sync callers submit
+    coroutines via run(); the loop lives for the process lifetime.
+    """
+
+    def __init__(self):
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._run_forever, name="claude-sdk-bridge", daemon=True)
+        self._thread.start()
+        self._closed = False
+
+    def _run_forever(self):
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+
+    def run(self, coro, timeout: float | None = None):
+        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return fut.result(timeout)
+
+    def shutdown(self):
+        if self._closed:
+            return
+        self._closed = True
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=5)
+
+
+_BRIDGE: _BridgeLoop | None = None
+_BRIDGE_LOCK = threading.Lock()
+
+
+def _get_bridge() -> _BridgeLoop:
+    """Process-wide singleton bridge loop."""
+    global _BRIDGE
+    with _BRIDGE_LOCK:
+        if _BRIDGE is None:
+            _BRIDGE = _BridgeLoop()
+        return _BRIDGE
