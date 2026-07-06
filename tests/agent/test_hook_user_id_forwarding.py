@@ -59,3 +59,25 @@ def test_agent_runtime_helpers_forwards_user_id():
 
 def test_model_tools_forwards_user_id():
     assert "user_id=" in _hook_call_window(mt)
+
+
+def test_helpers_return_verified_session_user_id():
+    """Behavioral guard: each edited site's ``_get_user_id_for_hooks`` resolves the
+    verified session ``user_id`` from the contextvar — not a hardcoded ``""``.
+
+    A textual ``user_id=`` assertion cannot catch a regression where the kwarg is
+    present but wired to the wrong value (e.g. ``user_id=""``). This drives the
+    real accessor: set the session contextvar, then confirm each helper returns it.
+    """
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    tokens = set_session_vars(platform="slack", user_id="U_VERIFIED")
+    try:
+        assert arh._get_user_id_for_hooks() == "U_VERIFIED"
+        assert mt._get_user_id_for_hooks() == "U_VERIFIED"
+    finally:
+        clear_session_vars(tokens)
+
+    # Outside any session, both degrade to "" (the pre-fix, fail-safe behavior).
+    assert arh._get_user_id_for_hooks() == ""
+    assert mt._get_user_id_for_hooks() == ""
