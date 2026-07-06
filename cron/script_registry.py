@@ -87,6 +87,32 @@ def _write_json(path: Path, data: dict) -> None:
 
 
 def stage_script(name: str, content: str, requested_by: str) -> dict:
-    safe = _validate_name(name, _staging_dir())   # raises ValueError on escape/empty
-    # size cap, queue cap, file + record writes: Task 3
-    raise NotImplementedError("full stage_script implemented in Task 3")
+    """Write a staging file + pending record. Raises ValueError on policy violation."""
+    safe = _validate_name(name, _staging_dir())
+    if content is None:
+        content = ""
+    if len(content.encode("utf-8")) > MAX_SCRIPT_BYTES:
+        raise ValueError(f"script exceeds {MAX_SCRIPT_BYTES} byte cap")
+    pending = _read_json(_pending_path())
+    if safe not in pending and len(pending) >= MAX_PENDING_ENTRIES:
+        raise ValueError(
+            f"pending-approval queue is full ({MAX_PENDING_ENTRIES}); "
+            "approve or clear entries"
+        )
+    digest = sha256_of(content)
+    (_staging_dir() / safe).write_text(content, encoding="utf-8")
+    preview = content if len(content) <= 800 else content[:800] + "\n... [truncated]"
+    ts = _hermes_now()
+    pending[safe] = {
+        "sha256": digest,
+        "authored_at": ts.isoformat(),
+        "requested_by": requested_by or "",
+        "preview": preview,
+    }
+    _write_json(_pending_path(), pending)
+    return {"name": safe, "sha256": digest}
+
+
+def list_pending() -> list:
+    pending = _read_json(_pending_path())
+    return [{"name": n, **rec} for n, rec in sorted(pending.items())]
