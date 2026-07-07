@@ -33,6 +33,7 @@ import contextvars
 import json
 import logging
 import os
+import re
 import threading
 from collections import OrderedDict
 from types import SimpleNamespace  # noqa: F401  (re-exported for test/consumer parity)
@@ -148,6 +149,20 @@ def _env_int(name: str, default: int | None) -> int | None:
     return val if val > 0 else None
 
 
+_INSTANCE_COUNTER = 0
+_INSTANCE_COUNTER_LOCK = threading.Lock()
+
+
+def _next_instance_id() -> int:
+    """Monotonic per-process id for a client's session-key fallback (see
+    ``ClaudeSdkClient._instance_key``). Counter, not ``id(self)``, because a
+    freed object's id() can be reused and alias a different client's sessions."""
+    global _INSTANCE_COUNTER
+    with _INSTANCE_COUNTER_LOCK:
+        _INSTANCE_COUNTER += 1
+        return _INSTANCE_COUNTER
+
+
 class _AwaitableResponse:
     """A resolved chat-completion response usable awaited OR directly.
 
@@ -236,6 +251,11 @@ class ClaudeSdkClient:
         self._max_turns = _env_int("HERMES_CLAUDE_SDK_MAX_TURNS", 40)
         self.chat = _ChatNamespace(self)
         self.is_closed = False
+        # Stable per-instance session-key fallback: used only when a create() call
+        # carries no session_key/session_id/user, so distinct clients never share a
+        # session bucket (no cross-user context bleed). A monotonic counter, not
+        # id(self), because id() can be reused after GC.
+        self._instance_key = f"claude-sdk-inst-{_next_instance_id()}"
         # Test-only injection point for the SDK turn (Tasks 4-8 replace the real
         # path); when None, ``_create_chat_completion`` raises NotImplementedError.
         self._run_turn_stub = None
@@ -265,7 +285,7 @@ class ClaudeSdkClient:
             for k in ("task_id", "tool_call_id", "session_id", "turn_id", "api_request_id")
         }
 
-        key = _session_key_for(kwargs)
+        key = _session_key_for(kwargs, fallback=self._instance_key)
         session = _get_or_make_session(key)
         decision = session.reconcile(messages)
 
@@ -273,9 +293,7 @@ class ClaudeSdkClient:
             logger.info("claude-sdk: session reseed (%s)", decision.reseed_reason)
             if session.sdk_client is not None:
                 _disconnect_client_on_bridge(session.sdk_client)
-            session.sdk_client = None
-            session.session_id = ""
-            session.shadow = []
+            _reset_session_state(session)
             new_prompt = _render_history_for_reseed(
                 _strip_system(messages), eff_model, tools)
             sent_user_msgs = _strip_system(messages)
@@ -296,7 +314,7 @@ class ClaudeSdkClient:
         except concurrent_futures.TimeoutError as exc:
             # A bridge .run() timeout does NOT cancel the coroutine still executing
             # on the loop, so we must explicitly interrupt() the live client to
-            # stop the wedged turn; then null the client so the next turn reseeds.
+            # stop the wedged turn.
             logger.warning(
                 "claude-sdk: turn timeout after %ss; interrupting live client",
                 getattr(self, "_turn_timeout", None))
@@ -306,8 +324,19 @@ class ClaudeSdkClient:
                     _get_bridge().run(sdk_client.interrupt(), timeout=5)
                 except Exception:  # pragma: no cover - best-effort interrupt
                     logger.debug("claude-sdk: interrupt() on timeout failed", exc_info=True)
-            session.sdk_client = None  # session is in a bad state -> reseed next turn
+            # Session is in a bad state: drop the client AND the shadow so the next
+            # turn reconciles as a restart and reseeds the FULL rendered history.
+            _reset_session_state(session)
             raise _SdkSubprocessError("turn timeout") from exc
+        except Exception:
+            # ANY turn failure (subprocess death, no-result, auth/quota, etc.) that
+            # propagates here leaves the session mid-conversation with no assistant
+            # reply appended. Clearing the shadow (belt-and-suspenders over the
+            # in-turn resets) guarantees the next turn reseeds the full history
+            # instead of matching a stale prefix and silently dropping the
+            # conversation. Re-raise so the outer retry loop still sees the error.
+            _reset_session_state(session)
+            raise
 
         # Keep the shadow in lock-step with what the live SDK session now knows:
         # the user message(s) we sent + the assistant final text (Task 6 strategy).
@@ -336,6 +365,21 @@ class ClaudeSdkClient:
         return SimpleNamespace(choices=[choice], usage=usage_ns, model=eff_model)
 
     async def _run_sdk_turn(
+        self, session, new_prompt, eff_model, tools, ctx, turn_ids, system_text,
+    ):
+        """Serialise same-session turns, then run one agentic SDK turn.
+
+        The per-session lock ensures two overlapping requests that resolve to the
+        SAME ``_SdkSession`` (same session key) do not interleave query() /
+        receive_response() on the one live client — which would let one turn drain
+        the other's ResultMessage (cross-talk / _SdkNoResultError). Distinct
+        sessions still run concurrently on the bridge loop.
+        """
+        async with session.turn_lock():
+            return await self._run_sdk_turn_locked(
+                session, new_prompt, eff_model, tools, ctx, turn_ids, system_text)
+
+    async def _run_sdk_turn_locked(
         self, session, new_prompt, eff_model, tools, ctx, turn_ids, system_text,
     ):
         """Run one full agentic SDK turn on the bridge loop; return (text, usage).
@@ -404,7 +448,11 @@ class ClaudeSdkClient:
             # client is likely dead now, so drop it to force a reseed next turn.
             stderr = getattr(exc, "stderr", None)
             msg_text = str(stderr) if stderr else str(exc)
-            session.sdk_client = None
+            # Drop the (likely dead) client AND the shadow: a half-finished turn
+            # left no assistant reply appended, so keeping the shadow would make
+            # the next turn a spurious prefix-match and drop the conversation.
+            # Clearing it forces a clean full-history reseed next turn.
+            _reset_session_state(session)
             classified = _classify_cli_error(msg_text)
             if type(classified) is not ClaudeCliError:
                 logger.warning(
@@ -526,11 +574,65 @@ def _strip_system(messages: list) -> list:
     return [m for m in (messages or []) if m.get("role") != "system"]
 
 
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def _normalize_content(content: object) -> str:
+    """Normalize a message's content for shadow/incoming equivalence.
+
+    The shadow records the raw SDK assistant text, but Hermes post-processes the
+    assistant message it stores/replays (``strip_think_blocks`` removes inline
+    ``<think>…</think>`` reasoning, plus whitespace trimming). A byte-exact dict
+    compare would therefore see the replayed assistant turn as different from the
+    shadow and force a full reseed EVERY turn — defeating the whole point of the
+    persistent SDK session. Comparing on this normalized form (think-blocks
+    stripped, whitespace collapsed) makes the prefix check robust to those
+    cosmetic transforms while still catching real rewrites/compression.
+    """
+    text = _safe_content(content)
+    text = _THINK_BLOCK_RE.sub("", text)
+    return " ".join(text.split())
+
+
+def _msg_equiv(a: dict, b: dict) -> bool:
+    """Two OpenAI messages are equivalent for reconciliation if same role and
+    normalized content (see :func:`_normalize_content`)."""
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return a == b
+    return (a.get("role") == b.get("role")
+            and _normalize_content(a.get("content")) == _normalize_content(b.get("content")))
+
+
+def _is_prefix(shadow: list, incoming: list) -> bool:
+    """True if ``shadow`` is a prefix of ``incoming`` under :func:`_msg_equiv`."""
+    if len(shadow) > len(incoming):
+        return False
+    return all(_msg_equiv(s, i) for s, i in zip(shadow, incoming))
+
+
 @dataclass
 class _SdkSession:
     session_id: str
     shadow: list = field(default_factory=list)   # non-system OpenAI messages fed so far
     sdk_client: object | None = None             # live ClaudeSDKClient (Task 7)
+    # Per-session turn lock (lazily created on the bridge loop): serialises
+    # concurrent turns that map to the SAME session so two overlapping requests
+    # can't interleave query()/receive_response() on the one live client and
+    # steal each other's ResultMessage. Not a dataclass field default (an
+    # asyncio.Lock must be created inside the running loop) — see _turn_lock().
+    _lock: object = None
+
+    def turn_lock(self):
+        """Return this session's asyncio.Lock, creating it on first use.
+
+        Must be called from the bridge loop (where the lock will be awaited), so
+        the lock binds to that loop. Concurrent creation is not a concern: all
+        _run_sdk_turn coroutines for a given session run on the single bridge loop
+        thread, so this runs without true parallelism.
+        """
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     # SHADOW-UPDATE STRATEGY (for Task 7 — do NOT "fix" reconcile to compensate):
     # The shadow list mirrors BOTH roles the live SDK session already knows about
@@ -574,7 +676,11 @@ class _SdkSession:
             # returns the single new user message as new_messages.
 
         n = len(self.shadow)
-        if self.shadow != incoming_nonsys[:n]:
+        # Prefix check under normalized equivalence (not byte-exact): tolerates
+        # Hermes' cosmetic assistant-text transforms (think-block stripping,
+        # whitespace) so a normal multi-turn conversation does NOT reseed, while a
+        # genuine rewrite/compression still fails the check and reseeds.
+        if not _is_prefix(self.shadow, incoming_nonsys):
             reason = ("restart-no-shadow" if not self.shadow
                       else "history-rewritten")
             return _ReconcileDecision(reseed=True, reseed_reason=reason)
@@ -603,21 +709,53 @@ def _render_history_for_reseed(messages: list, model: str, tools: list) -> str:
 # a fresh session (empty shadow) and reconcile reseeds from rendered history —
 # correct-but-cold; we deliberately do NOT keep resume state for v1.
 # ---------------------------------------------------------------------------
-_SESSION_CAP = int(os.getenv("HERMES_CLAUDE_SDK_SESSION_CAP", "8") or "8")
+# Session-cap: reuse the import-safe ``_env_int`` (unset/garbage -> default),
+# but coerce its ``0 -> None`` (uncapped) convention back to a concrete positive
+# cap — an unbounded session store would leak subprocesses without limit. The
+# old ``int(os.getenv(..., "8") or "8")`` crashed the whole provider's import on
+# a non-numeric env value; this degrades to the default instead.
+_SESSION_CAP = _env_int("HERMES_CLAUDE_SDK_SESSION_CAP", 8) or 8
 _SESSIONS: "OrderedDict[str, _SdkSession]" = OrderedDict()
 _SESSIONS_LOCK = threading.Lock()
 
 
-def _session_key_for(kwargs: dict) -> str:
-    """Derive a stable session key from create() kwargs.
+def _session_key_for(kwargs: dict, *, fallback: str) -> str:
+    """Derive a stable per-conversation session key from create() kwargs.
 
-    Prefer an explicit ``session_key``; fall back to ``user`` (OpenAI's stable
-    per-user field, which Hermes populates with the verified user id), else a
-    single ``"default"`` bucket. reconcile() keeps history correct regardless of
-    how coarse the key is, so a single stable value is sufficient for v1.
+    Preference order: explicit ``session_key`` > gateway ``session_id`` (set by
+    ``agent/transports/chat_completions.py``) > ``user`` (OpenAI's per-user
+    field, populated with the verified user id).
+
+    SECURITY: when NONE of those identify the conversation, we must NOT collapse
+    every caller into one shared ``"default"`` bucket — on the shared multi-user
+    deploy that would map two users onto a single ``_SdkSession`` (one live SDK
+    client + one shadow history), leaking one user's context into another's turn.
+    Instead we fall back to a per-client-instance unique id (``fallback``), which
+    keeps distinct clients isolated. The cost is only a colder cache when no
+    session id is threaded — never a cross-user leak.
     """
 
-    return kwargs.get("session_key") or kwargs.get("user") or "default"
+    return (
+        kwargs.get("session_key")
+        or kwargs.get("session_id")
+        or kwargs.get("user")
+        or fallback
+    )
+
+
+def _reset_session_state(session: "_SdkSession") -> None:
+    """Drop a session's live client + all replay state so the NEXT turn reseeds
+    from the full rendered history.
+
+    Used by the reseed path and by both error/timeout handlers. Clearing the
+    shadow is the load-bearing part: nulling only ``sdk_client`` would leave the
+    shadow a valid prefix of the next incoming, so reconcile would send just the
+    new message and silently drop the conversation. Does NOT disconnect the
+    client (the reseed path disconnects explicitly; error paths already lost it).
+    """
+    session.sdk_client = None
+    session.session_id = ""
+    session.shadow = []
 
 
 def _disconnect_client_on_bridge(client: object) -> None:
@@ -645,20 +783,29 @@ def _get_or_make_session(key: str) -> "_SdkSession":
     discarded; a later request with that key rebuilds cold via reseed.
     """
 
+    evicted_clients: list = []
     with _SESSIONS_LOCK:
         existing = _SESSIONS.get(key)
         if existing is not None:
             _SESSIONS.move_to_end(key)
             return existing
+        # New key: OrderedDict inserts at the most-recent end already, so no
+        # move_to_end is needed here.
         session = _SdkSession(session_id="")
         _SESSIONS[key] = session
-        _SESSIONS.move_to_end(key)
         while len(_SESSIONS) > _SESSION_CAP:
             _evicted_key, evicted = _SESSIONS.popitem(last=False)
-            if getattr(evicted, "sdk_client", None) is not None:
-                _disconnect_client_on_bridge(evicted.sdk_client)
+            client = getattr(evicted, "sdk_client", None)
+            if client is not None:
                 evicted.sdk_client = None
-        return session
+                evicted_clients.append(client)
+    # Disconnect evicted clients OUTSIDE the lock: _disconnect_client_on_bridge
+    # blocks up to 5s on a wedged/half-open subprocess, and holding _SESSIONS_LOCK
+    # across it would freeze every concurrent _get_or_make_session (all claude-sdk
+    # traffic) for that whole window.
+    for client in evicted_clients:
+        _disconnect_client_on_bridge(client)
+    return session
 
 
 # ---------------------------------------------------------------------------
@@ -749,16 +896,24 @@ def _capture_ctx() -> contextvars.Context:
 
 
 def _extract_text_and_error(raw: str) -> tuple[str, bool]:
-    """``handle_function_call`` returns a JSON string. A block/error is
-    ``{"error": <msg>}`` (a denial). Anything else is a normal result;
-    return it verbatim as text, ``is_error=False``."""
+    """``handle_function_call`` returns a JSON string. A hook block / denial is
+    ``{"error": <non-empty message>}``. Anything else is a normal result; return
+    it verbatim as text, ``is_error=False``.
+
+    IMPORTANT: a denial is signalled only by a *truthy* top-level ``error`` value.
+    Many successful tool payloads legitimately carry an ``error`` key set to
+    ``null``/``""``/``0`` alongside the real result (e.g. terminal returns
+    ``{"output": ..., "error": ""}``); treating those as failures would strip the
+    real data and make the model see a spurious error. So we flag is_error only
+    when ``error`` is present AND truthy.
+    """
     if not isinstance(raw, str):
         return str(raw), False
     try:
         obj = json.loads(raw)
     except (ValueError, TypeError):
         return raw, False  # non-JSON string result -> pass through
-    if isinstance(obj, dict) and "error" in obj:
+    if isinstance(obj, dict) and obj.get("error"):
         return str(obj["error"]), True
     return raw, False
 
@@ -800,9 +955,14 @@ def _make_proxy_handler(original_name, *, capture_ctx, turn_ids=None):
                 api_request_id=turn_ids.get("api_request_id", ""),
             )
 
-        # Run the (sync) Hermes dispatch under the captured contextvars so the
-        # RBAC hook sees the verified user_id on the bridge thread.
-        raw = capture_ctx.run(_dispatch)
+        # Run the (sync, potentially long — up to the tool's own timeout) Hermes
+        # dispatch in a worker THREAD, not inline on the bridge loop. Running it
+        # inline would block the single shared bridge event loop for the entire
+        # tool execution, freezing every other session's streaming turn. We still
+        # run it under the captured contextvars (``capture_ctx.run``) so the RBAC
+        # hook sees the verified user_id — the Context travels into the worker
+        # thread with the callable.
+        raw = await asyncio.to_thread(capture_ctx.run, _dispatch)
         return _to_mcp_result(raw)
 
     return _handler

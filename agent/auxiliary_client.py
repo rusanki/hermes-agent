@@ -4180,14 +4180,29 @@ def resolve_provider_client(
             if provider == "claude-sdk" and not command:
                 # The claude-sdk primary bundles its own CLI, so its resolved
                 # ``command`` may be empty — but the aux ClaudeCliClient needs a
-                # working ``claude`` binary to launch ``claude -p``.  Resolve
-                # claude-cli creds and borrow its command/args/base_url so the
-                # aux client is ALWAYS a runnable ClaudeCliClient.
-                from hermes_cli.auth import resolve_external_process_provider_credentials
-                cli_creds = resolve_external_process_provider_credentials("claude-cli")
-                command = str(cli_creds.get("command", "")).strip() or None
-                args = list(cli_creds.get("args") or [])
-                base_url = str(cli_creds.get("base_url", "")).strip() or base_url
+                # working ``claude`` binary to launch ``claude -p``.  Try to borrow
+                # claude-cli's resolved command/args/base_url.
+                #
+                # resolve_external_process_provider_credentials("claude-cli") RAISES
+                # AuthError when no ``claude`` binary is on PATH — but that is the
+                # exact deployment claude-sdk is designed to support (SDK-bundled
+                # CLI, no standalone binary). So a missing binary must NOT crash the
+                # aux side-task (compression/title/vision); fall back to letting the
+                # ClaudeCliClient resolve its own command (its default is "claude",
+                # same as the SDK's bundled resolution).
+                from hermes_cli.auth import (
+                    AuthError,
+                    resolve_external_process_provider_credentials,
+                )
+                try:
+                    cli_creds = resolve_external_process_provider_credentials("claude-cli")
+                    command = str(cli_creds.get("command", "")).strip() or None
+                    args = list(cli_creds.get("args") or [])
+                    base_url = str(cli_creds.get("base_url", "")).strip() or base_url
+                except AuthError:
+                    logger.debug(
+                        "aux: no standalone claude binary for claude-sdk borrow; "
+                        "letting ClaudeCliClient resolve its own command")
             from agent.claude_cli_client import ClaudeCliClient
 
             client = ClaudeCliClient(
