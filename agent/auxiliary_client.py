@@ -191,6 +191,8 @@ _PROVIDER_ALIASES = {
     "copilot-acp-agent": "copilot-acp",
     "claude-code-cli": "claude-cli",
     "claude_subscription": "claude-cli",
+    "claude-agent-sdk": "claude-sdk",
+    "claude_sdk": "claude-sdk",
     "tencent": "tencent-tokenhub",
     "tokenhub": "tencent-tokenhub",
     "tencent-cloud": "tencent-tokenhub",
@@ -3501,7 +3503,8 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
         # ``.chat.completions.create`` themselves.
         from agent.copilot_acp_client import CopilotACPClient
         from agent.claude_cli_client import ClaudeCliClient
-        if isinstance(sync_client, (CopilotACPClient, ClaudeCliClient)):
+        from agent.claude_sdk_client import ClaudeSdkClient
+        if isinstance(sync_client, (CopilotACPClient, ClaudeCliClient, ClaudeSdkClient)):
             return sync_client, model
     except ImportError:
         pass
@@ -4153,22 +4156,38 @@ def resolve_provider_client(
             logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
             return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                     else (client, final_model))
-        if provider == "claude-cli":
+        if provider in ("claude-cli", "claude-sdk"):
             # Route ALL Anthropic auxiliary traffic (context compression,
-            # session-title generation, vision side-tasks) through the
-            # ``claude -p`` SUBPROCESS — never the direct-HTTP Anthropic OAuth
-            # path (build_anthropic_client), which would silently bill against
-            # "extra usage".  Default to a CHEAP aux model so side-tasks stay
-            # inexpensive and so we never trip the empty-model (None,None) guard
-            # for lack of a configured model.
+            # session-title generation, vision side-tasks) through the CHEAP
+            # ``claude -p`` SUBPROCESS (``ClaudeCliClient``) — never the
+            # direct-HTTP Anthropic OAuth path (build_anthropic_client), which
+            # would silently bill against "extra usage".  For a claude-sdk
+            # PRIMARY the aux client must ALSO be a cheap ClaudeCliClient, NOT a
+            # second ClaudeSdkClient (which runs the full SDK inner tool loop —
+            # far too expensive for a title/compression side-task).  Default to
+            # a CHEAP aux model so side-tasks stay inexpensive and so we never
+            # trip the empty-model (None,None) guard for lack of a configured
+            # model.
             if not final_model:
-                final_model = _normalize_resolved_model(
-                    _get_aux_model_for_provider("claude-cli"), provider
-                )
+                # Prefer this provider's own aux model; fall back to claude-cli's
+                # cheap aux model so claude-sdk always resolves a non-empty model.
+                aux_model = _get_aux_model_for_provider(provider) or _get_aux_model_for_provider("claude-cli")
+                final_model = _normalize_resolved_model(aux_model, provider)
             command = str(creds.get("command", "")).strip() or None
             args = list(creds.get("args") or [])
             api_key = str(creds.get("api_key", "")).strip() or None
             base_url = str(creds.get("base_url", "")).strip() or None
+            if provider == "claude-sdk" and not command:
+                # The claude-sdk primary bundles its own CLI, so its resolved
+                # ``command`` may be empty — but the aux ClaudeCliClient needs a
+                # working ``claude`` binary to launch ``claude -p``.  Resolve
+                # claude-cli creds and borrow its command/args/base_url so the
+                # aux client is ALWAYS a runnable ClaudeCliClient.
+                from hermes_cli.auth import resolve_external_process_provider_credentials
+                cli_creds = resolve_external_process_provider_credentials("claude-cli")
+                command = str(cli_creds.get("command", "")).strip() or None
+                args = list(cli_creds.get("args") or [])
+                base_url = str(cli_creds.get("base_url", "")).strip() or base_url
             from agent.claude_cli_client import ClaudeCliClient
 
             client = ClaudeCliClient(
