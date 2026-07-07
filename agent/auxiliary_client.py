@@ -3503,8 +3503,18 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
         # ``.chat.completions.create`` themselves.
         from agent.copilot_acp_client import CopilotACPClient
         from agent.claude_cli_client import ClaudeCliClient
-        from agent.claude_sdk_client import ClaudeSdkClient
-        if isinstance(sync_client, (CopilotACPClient, ClaudeCliClient, ClaudeSdkClient)):
+        subprocess_client_types: tuple = (CopilotACPClient, ClaudeCliClient)
+        # ClaudeSdkClient's module imports the OPTIONAL ``claude_agent_sdk``
+        # package. Guard it SEPARATELY so that on a deploy without the claude-sdk
+        # extra installed, the ImportError does not abort this whole block and
+        # skip the copilot/claude-cli short-circuit above (which would re-wrap a
+        # subprocess client as HTTP and break every async aux call).
+        try:
+            from agent.claude_sdk_client import ClaudeSdkClient
+            subprocess_client_types = subprocess_client_types + (ClaudeSdkClient,)
+        except ImportError:
+            pass
+        if isinstance(sync_client, subprocess_client_types):
             return sync_client, model
     except ImportError:
         pass
@@ -4179,17 +4189,14 @@ def resolve_provider_client(
             base_url = str(creds.get("base_url", "")).strip() or None
             if provider == "claude-sdk" and not command:
                 # The claude-sdk primary bundles its own CLI, so its resolved
-                # ``command`` may be empty — but the aux ClaudeCliClient needs a
-                # working ``claude`` binary to launch ``claude -p``.  Try to borrow
-                # claude-cli's resolved command/args/base_url.
-                #
-                # resolve_external_process_provider_credentials("claude-cli") RAISES
-                # AuthError when no ``claude`` binary is on PATH — but that is the
-                # exact deployment claude-sdk is designed to support (SDK-bundled
-                # CLI, no standalone binary). So a missing binary must NOT crash the
-                # aux side-task (compression/title/vision); fall back to letting the
-                # ClaudeCliClient resolve its own command (its default is "claude",
-                # same as the SDK's bundled resolution).
+                # ``command`` may be empty. Aux traffic (compression / title /
+                # vision) prefers the CHEAP claude-cli subprocess, which needs a
+                # real ``claude`` binary. Try to borrow claude-cli's resolved
+                # command; if there is no standalone binary (the SDK-bundled-only
+                # deploy), do NOT hand ClaudeCliClient a command it can't launch
+                # (that would spawn a doomed ``claude -p``). Instead route aux
+                # through a ClaudeSdkClient, which uses the SAME bundled CLI the
+                # primary uses and is guaranteed runnable here.
                 from hermes_cli.auth import (
                     AuthError,
                     resolve_external_process_provider_credentials,
@@ -4201,8 +4208,15 @@ def resolve_provider_client(
                     base_url = str(cli_creds.get("base_url", "")).strip() or base_url
                 except AuthError:
                     logger.debug(
-                        "aux: no standalone claude binary for claude-sdk borrow; "
-                        "letting ClaudeCliClient resolve its own command")
+                        "aux: no standalone claude binary to borrow for claude-sdk; "
+                        "routing aux through the SDK-bundled CLI (ClaudeSdkClient)")
+                    from agent.claude_sdk_client import ClaudeSdkClient
+                    sdk_aux = ClaudeSdkClient(
+                        api_key=api_key, base_url=base_url, model=final_model)
+                    logger.debug("resolve_provider_client: %s aux via SDK (%s)",
+                                 provider, final_model)
+                    return (_to_async_client(sdk_aux, final_model, is_vision=is_vision)
+                            if async_mode else (sdk_aux, final_model))
             from agent.claude_cli_client import ClaudeCliClient
 
             client = ClaudeCliClient(

@@ -42,7 +42,13 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 CLAUDE_SDK_MARKER_BASE_URL = "claude-sdk://local"
-_DEFAULT_MODEL = "claude-haiku-4-5"  # matches claude-cli default; override via config
+# Last-resort primary model when neither the per-call model nor the client's
+# configured default is set. MUST match the claude-cli sibling
+# (claude_cli_client._DEFAULT_MODEL = "claude-opus-4-8") so the two lanes don't
+# silently diverge into a cheaper model for a primary turn. Normally unreached —
+# the model is threaded from config/kwargs — but a bare fallback to Haiku would
+# be a silent capability downgrade.
+_DEFAULT_MODEL = "claude-opus-4-8"
 
 
 def _normalize_model(m: str | None) -> str:
@@ -280,13 +286,38 @@ class ClaudeSdkClient:
             if isinstance(m, dict) and m.get("role") == "system"
         ).strip()
 
+        # Correlation ids for the tool pipeline. Prefer explicit create() kwargs,
+        # then the gateway session id, and finally the session key itself so that
+        # DISTINCT conversations never collapse onto the ``task_id or "default"``
+        # bucket inside handle_function_call (terminal/browser session isolation).
+        # Without this, every sdk-lane tool call would carry task_id="" and two
+        # conversations' terminal/browser state would bleed together.
+        key = _session_key_for(kwargs, fallback=self._instance_key)
         turn_ids = {
             k: kwargs.get(k, "")
             for k in ("task_id", "tool_call_id", "session_id", "turn_id", "api_request_id")
         }
+        if not turn_ids["task_id"]:
+            turn_ids["task_id"] = kwargs.get("session_id") or key
+        if not turn_ids["session_id"]:
+            turn_ids["session_id"] = key
 
-        key = _session_key_for(kwargs, fallback=self._instance_key)
         session = _get_or_make_session(key)
+
+        # Hold the per-session lock across the ENTIRE critical section: reconcile
+        # reads the shadow, the reseed path tears down the live client, the turn
+        # drives that client, and the shadow update is a read-modify-write. Two
+        # same-session create() calls interleaving any of these would tear down
+        # each other's in-flight stream or corrupt the shadow. The lock lives on
+        # the caller thread (this method), which is where all that state lives.
+        with session.lock:
+            return self._run_locked_turn(
+                key, session, messages, tools, eff_model, system_text, ctx, turn_ids)
+
+    def _run_locked_turn(
+        self, key, session, messages, tools, eff_model, system_text, ctx, turn_ids,
+    ):
+        """The per-session-locked turn body (see _create_chat_completion)."""
         decision = session.reconcile(messages)
 
         if decision.reseed:
@@ -298,12 +329,26 @@ class ClaudeSdkClient:
                 _strip_system(messages), eff_model, tools)
             sent_user_msgs = _strip_system(messages)
         else:
+            sent_user_msgs = decision.new_messages
             new_prompt = "\n\n".join(
                 _safe_content(m.get("content"))
-                for m in decision.new_messages
+                for m in sent_user_msgs
                 if isinstance(m, dict)
             ).strip()
-            sent_user_msgs = decision.new_messages
+
+        # Empty-query short-circuit: if the reconcile found no NEW user message
+        # (incoming == shadow, or a retry/regeneration with an assistant/tool-only
+        # tail), there is nothing to ask the SDK. Querying "" would waste a turn
+        # AND append a bogus assistant entry to the shadow that breaks the next
+        # real turn's prefix match. Return the last known assistant text instead.
+        if not new_prompt.strip():
+            last_text = ""
+            for m in reversed(session.shadow):
+                if isinstance(m, dict) and m.get("role") == "assistant":
+                    last_text = _safe_content(m.get("content"))
+                    break
+            logger.info("claude-sdk: no new user message; returning cached final text")
+            return _build_response(last_text, {}, eff_model)
 
         try:
             text, usage = _get_bridge().run(
@@ -313,28 +358,24 @@ class ClaudeSdkClient:
             )
         except concurrent_futures.TimeoutError as exc:
             # A bridge .run() timeout does NOT cancel the coroutine still executing
-            # on the loop, so we must explicitly interrupt() the live client to
-            # stop the wedged turn.
+            # on the loop. Best-effort interrupt AND disconnect the wedged client
+            # (interrupt() is only a stream control message — disconnect closes the
+            # transport / reaps the subprocess so it does not leak). Then REPLACE
+            # the whole session object: an in-place reset would keep this same
+            # object (and, in the old asyncio-lock design, a lock the wedged
+            # coroutine might still hold). A fresh object guarantees the next turn
+            # starts clean with no poisoned state.
             logger.warning(
-                "claude-sdk: turn timeout after %ss; interrupting live client",
+                "claude-sdk: turn timeout after %ss; interrupting + replacing session",
                 getattr(self, "_turn_timeout", None))
-            sdk_client = getattr(session, "sdk_client", None)
-            if sdk_client is not None:
-                try:
-                    _get_bridge().run(sdk_client.interrupt(), timeout=5)
-                except Exception:  # pragma: no cover - best-effort interrupt
-                    logger.debug("claude-sdk: interrupt() on timeout failed", exc_info=True)
-            # Session is in a bad state: drop the client AND the shadow so the next
-            # turn reconciles as a restart and reseeds the FULL rendered history.
-            _reset_session_state(session)
+            _teardown_wedged_client(getattr(session, "sdk_client", None))
+            _replace_session(key, session)
             raise _SdkSubprocessError("turn timeout") from exc
         except Exception:
-            # ANY turn failure (subprocess death, no-result, auth/quota, etc.) that
-            # propagates here leaves the session mid-conversation with no assistant
-            # reply appended. Clearing the shadow (belt-and-suspenders over the
-            # in-turn resets) guarantees the next turn reseeds the full history
-            # instead of matching a stale prefix and silently dropping the
-            # conversation. Re-raise so the outer retry loop still sees the error.
+            # ANY turn failure leaves the session mid-conversation with no
+            # assistant reply appended. Clear the client + shadow so the next turn
+            # reseeds the full history instead of matching a stale prefix and
+            # silently dropping the conversation. Re-raise for the outer retry loop.
             _reset_session_state(session)
             raise
 
@@ -342,44 +383,9 @@ class ClaudeSdkClient:
         # the user message(s) we sent + the assistant final text (Task 6 strategy).
         session.shadow.extend(sent_user_msgs)
         session.shadow.append({"role": "assistant", "content": text})
-
-        prompt_tokens = usage.get("prompt_tokens", 0)
-        completion_tokens = usage.get("completion_tokens", 0)
-        cached_tokens = usage.get("cached_tokens", 0)
-        usage_ns = SimpleNamespace(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-            prompt_tokens_details=SimpleNamespace(cached_tokens=cached_tokens),
-        )
-        assistant_message = SimpleNamespace(
-            content=text,
-            tool_calls=None,  # claude-sdk: SDK ran the full inner loop -> always None
-            reasoning=None,
-            reasoning_content=None,
-            reasoning_details=None,
-        )
-        # finish_reason is ALWAYS "stop": the SDK produced a single-shot final
-        # answer, so Hermes' outer loop does not iterate (Approach B).
-        choice = SimpleNamespace(message=assistant_message, finish_reason="stop")
-        return SimpleNamespace(choices=[choice], usage=usage_ns, model=eff_model)
+        return _build_response(text, usage, eff_model)
 
     async def _run_sdk_turn(
-        self, session, new_prompt, eff_model, tools, ctx, turn_ids, system_text,
-    ):
-        """Serialise same-session turns, then run one agentic SDK turn.
-
-        The per-session lock ensures two overlapping requests that resolve to the
-        SAME ``_SdkSession`` (same session key) do not interleave query() /
-        receive_response() on the one live client — which would let one turn drain
-        the other's ResultMessage (cross-talk / _SdkNoResultError). Distinct
-        sessions still run concurrently on the bridge loop.
-        """
-        async with session.turn_lock():
-            return await self._run_sdk_turn_locked(
-                session, new_prompt, eff_model, tools, ctx, turn_ids, system_text)
-
-    async def _run_sdk_turn_locked(
         self, session, new_prompt, eff_model, tools, ctx, turn_ids, system_text,
     ):
         """Run one full agentic SDK turn on the bridge loop; return (text, usage).
@@ -574,7 +580,15 @@ def _strip_system(messages: list) -> list:
     return [m for m in (messages or []) if m.get("role") != "system"]
 
 
-_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+# Reasoning/think tag variants that Hermes' ``strip_think_blocks``
+# (agent_runtime_helpers) removes from stored assistant content. We mirror the
+# SAME set here so the shadow (raw SDK text) and the replayed (stripped) incoming
+# normalize to the same value — otherwise any of these variants would break the
+# reconcile prefix match and force a full reseed every turn.
+_THINK_BLOCK_RES = tuple(
+    re.compile(rf"<{tag}>.*?</{tag}>", re.DOTALL | re.IGNORECASE)
+    for tag in ("think", "thinking", "reasoning", "REASONING_SCRATCHPAD", "thought")
+)
 
 
 def _normalize_content(content: object) -> str:
@@ -590,7 +604,8 @@ def _normalize_content(content: object) -> str:
     cosmetic transforms while still catching real rewrites/compression.
     """
     text = _safe_content(content)
-    text = _THINK_BLOCK_RE.sub("", text)
+    for pat in _THINK_BLOCK_RES:
+        text = pat.sub("", text)
     return " ".join(text.split())
 
 
@@ -615,24 +630,16 @@ class _SdkSession:
     session_id: str
     shadow: list = field(default_factory=list)   # non-system OpenAI messages fed so far
     sdk_client: object | None = None             # live ClaudeSDKClient (Task 7)
-    # Per-session turn lock (lazily created on the bridge loop): serialises
-    # concurrent turns that map to the SAME session so two overlapping requests
-    # can't interleave query()/receive_response() on the one live client and
-    # steal each other's ResultMessage. Not a dataclass field default (an
-    # asyncio.Lock must be created inside the running loop) — see _turn_lock().
-    _lock: object = None
-
-    def turn_lock(self):
-        """Return this session's asyncio.Lock, creating it on first use.
-
-        Must be called from the bridge loop (where the lock will be awaited), so
-        the lock binds to that loop. Concurrent creation is not a concern: all
-        _run_sdk_turn coroutines for a given session run on the single bridge loop
-        thread, so this runs without true parallelism.
-        """
-        if self._lock is None:
-            self._lock = asyncio.Lock()
-        return self._lock
+    # Per-session SYNC lock, held on the CALLER thread across the WHOLE turn
+    # critical section (reconcile -> reseed/disconnect -> bridge turn -> shadow
+    # update). A threading.Lock (not asyncio.Lock) because _create_chat_completion
+    # runs on the sync caller thread, not the bridge loop; the reconcile + shadow
+    # read-modify-write and the reseed teardown all live there, outside any
+    # coroutine. Serialising the entire section is what prevents two same-session
+    # calls from (a) tearing down each other's live client mid-stream and (b)
+    # interleaving shadow mutations. ``field(init=False)`` so every session gets a
+    # fresh lock; it is never shared or reset.
+    lock: threading.Lock = field(default_factory=threading.Lock, init=False)
 
     # SHADOW-UPDATE STRATEGY (for Task 7 — do NOT "fix" reconcile to compensate):
     # The shadow list mirrors BOTH roles the live SDK session already knows about
@@ -743,6 +750,69 @@ def _session_key_for(kwargs: dict, *, fallback: str) -> str:
     )
 
 
+def _build_response(text: str, usage: dict, eff_model: str) -> Any:
+    """Assemble the OpenAI-compatible SimpleNamespace the loop expects.
+
+    finish_reason is ALWAYS "stop" and tool_calls ALWAYS None: the SDK ran the
+    full inner tool loop, so Hermes' outer loop sees a single-shot final answer
+    (Approach B) and never iterates.
+    """
+    prompt_tokens = usage.get("prompt_tokens", 0)
+    completion_tokens = usage.get("completion_tokens", 0)
+    cached_tokens = usage.get("cached_tokens", 0)
+    usage_ns = SimpleNamespace(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=prompt_tokens + completion_tokens,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=cached_tokens),
+    )
+    assistant_message = SimpleNamespace(
+        content=text,
+        tool_calls=None,
+        reasoning=None,
+        reasoning_content=None,
+        reasoning_details=None,
+    )
+    choice = SimpleNamespace(message=assistant_message, finish_reason="stop")
+    return SimpleNamespace(choices=[choice], usage=usage_ns, model=eff_model)
+
+
+def _teardown_wedged_client(client: object) -> None:
+    """Interrupt AND disconnect a timed-out client, best-effort, on the bridge.
+
+    ``interrupt()`` alone only sends a stream control message — it does not close
+    the transport or reap the ``claude`` subprocess, so a wedged turn would leak
+    the process. ``disconnect()`` closes it. Both are best-effort (the subprocess
+    may be unresponsive); neither is allowed to raise.
+    """
+    if client is None:
+        return
+    for op in ("interrupt", "disconnect"):
+        method = getattr(client, op, None)
+        if method is None:
+            continue
+        try:
+            _get_bridge().run(method(), timeout=5)
+        except Exception:  # pragma: no cover - best-effort teardown
+            logger.debug("claude-sdk: %s() on wedged client failed", op, exc_info=True)
+
+
+def _replace_session(key: str, old: "_SdkSession") -> None:
+    """Swap the session stored under ``key`` for a fresh one (timeout recovery).
+
+    A timed-out session may have a coroutine still wedged on the bridge loop; the
+    old object must NOT be reused (its shadow is stale and, historically, a lock
+    could be stuck held). Installing a brand-new ``_SdkSession`` guarantees the
+    next turn for this key starts clean. Caller holds ``old.lock``; the new object
+    has its own fresh lock, so releasing the old lock afterwards is harmless.
+    """
+    with _SESSIONS_LOCK:
+        # Only replace if the stored session is still the wedged one (a concurrent
+        # eviction may already have removed/replaced it).
+        if _SESSIONS.get(key) is old:
+            _SESSIONS[key] = _SdkSession(session_id="")
+
+
 def _reset_session_state(session: "_SdkSession") -> None:
     """Drop a session's live client + all replay state so the NEXT turn reseeds
     from the full rendered history.
@@ -794,7 +864,22 @@ def _get_or_make_session(key: str) -> "_SdkSession":
         session = _SdkSession(session_id="")
         _SESSIONS[key] = session
         while len(_SESSIONS) > _SESSION_CAP:
-            _evicted_key, evicted = _SESSIONS.popitem(last=False)
+            # Evict the oldest IDLE session. A session whose lock is held has a
+            # turn actively streaming on the bridge loop; disconnecting its client
+            # would kill that unrelated in-flight turn. Scan oldest-first for one
+            # that is not busy; if EVERY over-cap session is busy, allow going one
+            # over cap rather than murdering a live turn (the store self-corrects
+            # on the next insert once a turn finishes).
+            victim_key = None
+            for cand_key, cand in _SESSIONS.items():
+                if cand is session:
+                    continue  # never evict the one we just created
+                if not cand.lock.locked():
+                    victim_key = cand_key
+                    break
+            if victim_key is None:
+                break  # all others busy — tolerate transient over-cap
+            evicted = _SESSIONS.pop(victim_key)
             client = getattr(evicted, "sdk_client", None)
             if client is not None:
                 evicted.sdk_client = None

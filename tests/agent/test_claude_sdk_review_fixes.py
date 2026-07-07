@@ -105,18 +105,100 @@ def test_error_turn_resets_shadow_forcing_reseed(monkeypatch):
     assert sess.sdk_client is None
 
 
-# ── F9: a session exposes a per-session asyncio turn lock ────────────────────
-def test_session_turn_lock_is_created_and_stable():
+# ── F9/G1: each session owns a distinct per-session SYNC turn lock ───────────
+def test_session_has_distinct_sync_lock():
+    import threading
     from agent.claude_sdk_client import _SdkSession
+    s1 = _SdkSession(session_id="s1")
+    s2 = _SdkSession(session_id="s2")
+    # A real, acquirable threading lock, and NOT shared between sessions.
+    assert isinstance(s1.lock, type(threading.Lock()))
+    assert s1.lock is not s2.lock
+    with s1.lock:
+        assert s1.lock.locked()
+        assert not s2.lock.locked()  # locking one must not lock the other
 
-    async def _check():
-        sess = _SdkSession(session_id="s")
-        lock1 = sess.turn_lock()
-        lock2 = sess.turn_lock()
-        assert lock1 is lock2  # same lock instance reused
-        assert isinstance(lock1, asyncio.Lock)
 
-    asyncio.run(_check())
+# ── G2: a timed-out session is REPLACED in the store (fresh lock, no poison) ─
+def test_replace_session_swaps_in_fresh_object():
+    from agent import claude_sdk_client as m
+    m._SESSIONS.clear()
+    old = m._get_or_make_session("k1")
+    old.shadow = [{"role": "user", "content": "stale"}]
+    m._replace_session("k1", old)
+    new = m._SESSIONS["k1"]
+    assert new is not old
+    assert new.shadow == []
+    assert new.lock is not old.lock  # fresh lock -> no poisoned-lock reuse
+
+
+# ── G6: no new user message short-circuits (no empty SDK query) ──────────────
+def test_empty_query_short_circuits_to_cached_text(monkeypatch):
+    from agent import claude_sdk_client as m
+
+    called = {"ran": False}
+
+    async def _should_not_run(self, *a, **k):
+        called["ran"] = True
+        return ("SHOULD NOT HAPPEN", {})
+
+    monkeypatch.setattr(m.ClaudeSdkClient, "_run_sdk_turn", _should_not_run, raising=False)
+    m._SESSIONS.clear()
+    client = m.ClaudeSdkClient()
+    key = client._instance_key
+    sess = m._get_or_make_session(key)
+    sess.shadow = [{"role": "user", "content": "u1"},
+                   {"role": "assistant", "content": "prior answer"}]
+    # Incoming == shadow (no new user turn): must NOT run a turn, must return the
+    # cached last assistant text.
+    resp = client.chat.completions.create(
+        model="claude-opus-4-8",
+        messages=[{"role": "user", "content": "u1"},
+                  {"role": "assistant", "content": "prior answer"}], tools=[])
+    assert called["ran"] is False
+    assert resp.choices[0].message.content == "prior answer"
+
+
+# ── G3: turn_ids must carry a non-empty task_id so tool sessions don't collide ─
+def test_turn_ids_task_id_defaults_to_session_key(monkeypatch):
+    from agent import claude_sdk_client as m
+
+    seen = {}
+
+    async def _capture(self, session, new_prompt, eff_model, tools, ctx, turn_ids, system_text):
+        seen["turn_ids"] = dict(turn_ids)
+        return ("ok", {})
+
+    monkeypatch.setattr(m.ClaudeSdkClient, "_run_sdk_turn", _capture, raising=False)
+    m._SESSIONS.clear()
+    client = m.ClaudeSdkClient()
+    client.chat.completions.create(
+        model="claude-opus-4-8",
+        messages=[{"role": "user", "content": "hi"}], tools=[],
+        session_id="CONV_42")
+    # task_id must be non-empty and tie to the conversation, not the shared ""
+    # "default" bucket that would bleed terminal/browser state across convos.
+    assert seen["turn_ids"]["task_id"] == "CONV_42"
+    assert seen["turn_ids"]["session_id"] == "CONV_42"
+
+
+# ── G(think): normalization strips ALL reasoning tag variants, not just <think> ─
+def test_normalize_strips_all_reasoning_variants():
+    from agent.claude_sdk_client import _normalize_content
+    for tag in ("think", "thinking", "reasoning", "REASONING_SCRATCHPAD", "thought"):
+        raw = f"<{tag}>hidden</{tag}>visible"
+        assert _normalize_content(raw) == "visible", tag
+
+
+def test_reasoning_variant_transform_does_not_reseed():
+    from agent.claude_sdk_client import _SdkSession
+    sess = _SdkSession(session_id="s")
+    sess.shadow = [{"role": "user", "content": "u1"},
+                   {"role": "assistant", "content": "<reasoning>x</reasoning>answer"}]
+    incoming = [{"role": "user", "content": "u1"},
+                {"role": "assistant", "content": "answer"},
+                {"role": "user", "content": "u2"}]
+    assert sess.reconcile(incoming).reseed is False
 
 
 # ── F7: LRU eviction disconnects the evicted client (outside the lock) ───────
