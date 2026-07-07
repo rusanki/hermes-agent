@@ -28,6 +28,8 @@ Sibling of ``agent/claude_cli_client.py``; that file is untouched (rollback lane
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import json
 import logging
 import os
 import threading
@@ -305,3 +307,97 @@ def _render_history_for_reseed(messages: list, model: str, tools: list) -> str:
     session. Reuse claude-cli's renderer so there's no new rendering code."""
     from agent.claude_cli_client import _format_messages_as_prompt
     return _format_messages_as_prompt(messages, model, tools, None)
+
+
+# ---------------------------------------------------------------------------
+# Task 5 — SECURITY-CRITICAL: in-process MCP tool proxy.
+#
+# Every native tool the model invokes on the SDK lane is routed through Hermes'
+# single-fire tool pipeline (``handle_function_call``), which runs RBAC, audit,
+# and redaction. We expose each OpenAI-shaped tool as an in-process MCP tool
+# named ``mcp__hermes__<original_name>``; the SDK CLI calls it, the proxy
+# handler dispatches into ``handle_function_call`` under a captured contextvars
+# snapshot so the RBAC hook sees the verified user_id on the bridge thread.
+#
+# ``handle_function_call`` is imported at module scope (not by closure) so
+# tests can ``monkeypatch.setattr(module, "handle_function_call", ...)`` — the
+# proxy handler calls the bare module-global name, which is resolved through
+# this module's namespace at call time.
+# ---------------------------------------------------------------------------
+from claude_agent_sdk import create_sdk_mcp_server  # noqa: E402
+from claude_agent_sdk import tool as sdk_tool  # noqa: E402
+
+from model_tools import handle_function_call  # noqa: E402  the single-fire hook entry
+
+HERMES_MCP_SERVER_NAME = "hermes"
+
+
+def _capture_ctx() -> contextvars.Context:
+    """Snapshot the current contextvars (incl. gateway ``_SESSION_USER_ID``) at
+    create() entry, so proxy handlers running on the bridge thread see the
+    verified user_id via ``_get_user_id_for_hooks()``."""
+    return contextvars.copy_context()
+
+
+def _extract_text_and_error(raw: str) -> tuple[str, bool]:
+    """``handle_function_call`` returns a JSON string. A block/error is
+    ``{"error": <msg>}`` (a denial). Anything else is a normal result;
+    return it verbatim as text, ``is_error=False``."""
+    if not isinstance(raw, str):
+        return str(raw), False
+    try:
+        obj = json.loads(raw)
+    except (ValueError, TypeError):
+        return raw, False  # non-JSON string result -> pass through
+    if isinstance(obj, dict) and "error" in obj:
+        return str(obj["error"]), True
+    return raw, False
+
+
+def _to_mcp_result(raw: str) -> dict:
+    """Translate ``handle_function_call``'s JSON-STRING result into the SDK MCP
+    result shape. A hook block ``{"error": msg}`` -> ``is_error=True``."""
+    text, is_error = _extract_text_and_error(raw)
+    return {"content": [{"type": "text", "text": text}], "is_error": is_error}
+
+
+def _make_proxy_handler(original_name, *, capture_ctx, turn_ids=None):
+    """Build an async MCP tool handler that dispatches into Hermes' executor
+    pipeline under the captured context. RBAC/audit/redaction all run inside
+    ``handle_function_call`` (``skip_pre_tool_call_hook=False`` => hook fires
+    once)."""
+    turn_ids = turn_ids or {}
+
+    async def _handler(args: dict) -> dict:
+        def _dispatch():
+            # Module-global lookup so monkeypatch.setattr can override it.
+            return handle_function_call(
+                original_name, args,
+                skip_pre_tool_call_hook=False,  # RBAC hook fires here
+                task_id=turn_ids.get("task_id", ""),
+                tool_call_id=turn_ids.get("tool_call_id", ""),
+                session_id=turn_ids.get("session_id", ""),
+                turn_id=turn_ids.get("turn_id", ""),
+                api_request_id=turn_ids.get("api_request_id", ""),
+            )
+
+        # Run the (sync) Hermes dispatch under the captured contextvars so the
+        # RBAC hook sees the verified user_id on the bridge thread.
+        raw = capture_ctx.run(_dispatch)
+        return _to_mcp_result(raw)
+
+    return _handler
+
+
+def _build_mcp_server(openai_tools, *, capture_ctx, turn_ids):
+    """Wrap each OpenAI function tool as an in-process MCP tool named
+    ``mcp__hermes__<original_name>``."""
+    sdk_tools = []
+    for t in (openai_tools or []):
+        fn = t.get("function", t)
+        name = fn["name"]
+        desc = fn.get("description", "")
+        schema = fn.get("parameters", {"type": "object", "properties": {}})
+        handler = _make_proxy_handler(name, capture_ctx=capture_ctx, turn_ids=turn_ids)
+        sdk_tools.append(sdk_tool(name, desc, schema)(handler))
+    return create_sdk_mcp_server(name=HERMES_MCP_SERVER_NAME, tools=sdk_tools)
