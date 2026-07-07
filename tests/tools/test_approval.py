@@ -529,6 +529,80 @@ class TestHermesConfigWriteProtection:
         assert dangerous is False
 
 
+class TestCronApprovedScriptsWriteProtection:
+    """Terminal-side protection for the cron approval pin registry and the
+    approved-scripts dir. A shell write here between approve and run would defeat
+    the hash pin (Task 8), so `>`, `>>`, `tee`, `cp`, `sed -i`, etc. targeting
+    them must be flagged dangerous — mirroring the config.yaml pairing."""
+
+    def test_redirect_over_approved_registry(self):
+        dangerous, key, desc = detect_dangerous_command(
+            "echo '{}' > ~/.hermes/cron/approved_scripts.json")
+        assert dangerous is True
+
+    def test_append_approved_registry(self):
+        dangerous, key, desc = detect_dangerous_command(
+            'echo x >> ~/.hermes/cron/approved_scripts.json')
+        assert dangerous is True
+
+    def test_tee_approved_registry(self):
+        dangerous, key, desc = detect_dangerous_command(
+            "echo x | tee ~/.hermes/cron/approved_scripts.json")
+        assert dangerous is True
+
+    def test_cp_over_approved_registry(self):
+        dangerous, key, desc = detect_dangerous_command(
+            "cp /tmp/evil.json ~/.hermes/cron/approved_scripts.json")
+        assert dangerous is True
+
+    def test_sed_in_place_approved_registry(self):
+        dangerous, key, desc = detect_dangerous_command(
+            "sed -i 's/abc/def/' ~/.hermes/cron/approved_scripts.json")
+        assert dangerous is True
+
+    def test_custom_hermes_home_approved_registry(self):
+        dangerous, key, desc = detect_dangerous_command(
+            "echo x | tee $HERMES_HOME/cron/approved_scripts.json")
+        assert dangerous is True
+
+    def test_absolute_hermes_home_approved_registry(self):
+        p = get_hermes_home() / "cron" / "approved_scripts.json"
+        dangerous, key, desc = detect_dangerous_command(f"sed -i 's/a/b/' {p}")
+        assert dangerous is True
+
+    def test_write_into_approved_scripts_dir(self):
+        dangerous, key, desc = detect_dangerous_command(
+            "echo 'print(1)' > ~/.hermes/scripts/approved/evil.py")
+        assert dangerous is True
+
+    def test_cp_into_approved_scripts_dir(self):
+        dangerous, key, desc = detect_dangerous_command(
+            "cp /tmp/evil.py ~/.hermes/scripts/approved/x.py")
+        assert dangerous is True
+
+    def test_tee_into_approved_scripts_dir_custom_home(self):
+        dangerous, key, desc = detect_dangerous_command(
+            "echo x | tee $HERMES_HOME/scripts/approved/x.py")
+        assert dangerous is True
+
+    def test_perl_in_place_approved_registry(self):
+        # perl -i is wired into the same in-place-edit pattern as sed -i; guard it.
+        dangerous, key, desc = detect_dangerous_command(
+            "perl -i -pe 's/a/b/' ~/.hermes/cron/approved_scripts.json")
+        assert dangerous is True
+
+    def test_ruby_in_place_approved_registry(self):
+        dangerous, key, desc = detect_dangerous_command(
+            "ruby -i -pe 'gsub(/a/,\"b\")' ~/.hermes/cron/approved_scripts.json")
+        assert dangerous is True
+
+    def test_staging_dir_not_blocked(self):
+        # Only approved/ is the security boundary; staging writes must NOT be gated.
+        dangerous, key, desc = detect_dangerous_command(
+            "echo 'print(1)' > ~/.hermes/scripts/staging/foo.py")
+        assert dangerous is False
+
+
 class TestFindExecFullPathRm:
     """Detect find -exec with full-path rm bypasses."""
 
