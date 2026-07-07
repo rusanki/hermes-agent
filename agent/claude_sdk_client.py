@@ -28,6 +28,7 @@ Sibling of ``agent/claude_cli_client.py``; that file is untouched (rollback lane
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures as concurrent_futures
 import contextvars
 import json
 import logging
@@ -126,6 +127,27 @@ def _build_sdk_env() -> dict[str, str]:
     return env
 
 
+def _env_float(name: str, default: float) -> float:
+    """Read a float env var, falling back to ``default`` on unset/garbage."""
+    try:
+        raw = os.getenv(name)
+        return float(raw) if raw not in (None, "") else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int(name: str, default: int | None) -> int | None:
+    """Read an int env var; unset/garbage -> ``default``, ``0`` -> ``None`` (uncapped)."""
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return default
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return val if val > 0 else None
+
+
 class _AwaitableResponse:
     """A resolved chat-completion response usable awaited OR directly.
 
@@ -204,6 +226,14 @@ class ClaudeSdkClient:
         self._cli_path = command or None
         self._args = list(args) if args else []
         self._default_model = model
+        # Task 8: hard wall-clock cap on a single SDK turn (the SDK runs the full
+        # inner tool loop, so a wedged tool/subprocess would otherwise hang the
+        # bridge indefinitely). Overridable via env; on timeout we interrupt() the
+        # live client and raise _SdkSubprocessError for the outer retry loop.
+        self._turn_timeout = _env_float("HERMES_CLAUDE_SDK_TURN_TIMEOUT", 600.0)
+        # Cap the SDK's internal turn count (defense against a runaway tool loop).
+        # Default 40 is a sane ceiling; env override, or "0"/unset -> None (uncapped).
+        self._max_turns = _env_int("HERMES_CLAUDE_SDK_MAX_TURNS", 40)
         self.chat = _ChatNamespace(self)
         self.is_closed = False
         # Test-only injection point for the SDK turn (Tasks 4-8 replace the real
@@ -257,11 +287,27 @@ class ClaudeSdkClient:
             ).strip()
             sent_user_msgs = decision.new_messages
 
-        text, usage = _get_bridge().run(
-            self._run_sdk_turn(
-                session, new_prompt, eff_model, tools, ctx, turn_ids, system_text),
-            timeout=getattr(self, "_turn_timeout", None),
-        )
+        try:
+            text, usage = _get_bridge().run(
+                self._run_sdk_turn(
+                    session, new_prompt, eff_model, tools, ctx, turn_ids, system_text),
+                timeout=getattr(self, "_turn_timeout", None),
+            )
+        except concurrent_futures.TimeoutError as exc:
+            # A bridge .run() timeout does NOT cancel the coroutine still executing
+            # on the loop, so we must explicitly interrupt() the live client to
+            # stop the wedged turn; then null the client so the next turn reseeds.
+            logger.warning(
+                "claude-sdk: turn timeout after %ss; interrupting live client",
+                getattr(self, "_turn_timeout", None))
+            sdk_client = getattr(session, "sdk_client", None)
+            if sdk_client is not None:
+                try:
+                    _get_bridge().run(sdk_client.interrupt(), timeout=5)
+                except Exception:  # pragma: no cover - best-effort interrupt
+                    logger.debug("claude-sdk: interrupt() on timeout failed", exc_info=True)
+            session.sdk_client = None  # session is in a bad state -> reseed next turn
+            raise _SdkSubprocessError("turn timeout") from exc
 
         # Keep the shadow in lock-step with what the live SDK session now knows:
         # the user message(s) we sent + the assistant final text (Task 6 strategy).
@@ -308,6 +354,8 @@ class ClaudeSdkClient:
                         tools, capture_ctx=ctx, turn_ids=turn_ids),
                 },
                 allowed_tools=["mcp__hermes__*"],
+                disallowed_tools=_DISALLOWED_BUILTINS,
+                can_use_tool=_deny_non_hermes,
                 model=eff_model or None,
                 cli_path=self._cli_path,
                 env=_build_sdk_env(),
@@ -331,21 +379,43 @@ class ClaudeSdkClient:
         final_text_parts: list[str] = []
         usage_dict: dict = {}
         saw_result = False
-        async for msg in session.sdk_client.receive_response():
-            if isinstance(msg, AssistantMessage):
-                for block in msg.content:
-                    if isinstance(block, TextBlock):
-                        final_text_parts.append(block.text)
-                    elif isinstance(block, ThinkingBlock):
-                        logger.debug("claude-sdk thinking: %.120s", block.thinking)
-                session.session_id = getattr(msg, "session_id", session.session_id)
-            elif isinstance(msg, ResultMessage):
-                usage_dict = msg.usage or {}
-                session.session_id = getattr(msg, "session_id", session.session_id)
-                saw_result = True
-                break  # receive_response() ends after ResultMessage anyway
+        # Wrap the drain: an SDK subprocess death (ProcessError) or any other
+        # ClaudeSDKError becomes either the classified ClaudeCliError (auth/quota
+        # wording, so the outer loop treats it like the cli lane) or an opaque
+        # _SdkSubprocessError. Both PROPAGATE for api_max_retries to handle.
+        try:
+            async for msg in session.sdk_client.receive_response():
+                if isinstance(msg, AssistantMessage):
+                    for block in msg.content:
+                        if isinstance(block, TextBlock):
+                            final_text_parts.append(block.text)
+                        elif isinstance(block, ThinkingBlock):
+                            logger.debug("claude-sdk thinking: %.120s", block.thinking)
+                    session.session_id = getattr(msg, "session_id", session.session_id)
+                elif isinstance(msg, ResultMessage):
+                    usage_dict = msg.usage or {}
+                    session.session_id = getattr(msg, "session_id", session.session_id)
+                    saw_result = True
+                    break  # receive_response() ends after ResultMessage anyway
+        except ClaudeSDKError as exc:
+            # Prefer the subprocess stderr (ProcessError) for classification; fall
+            # back to the exception string. Auth/quota wording -> classified
+            # ClaudeCliError; everything else -> _SdkSubprocessError. The live
+            # client is likely dead now, so drop it to force a reseed next turn.
+            stderr = getattr(exc, "stderr", None)
+            msg_text = str(stderr) if stderr else str(exc)
+            session.sdk_client = None
+            classified = _classify_cli_error(msg_text)
+            if type(classified) is not ClaudeCliError:
+                logger.warning(
+                    "claude-sdk: subprocess reported %s error: %.200s",
+                    type(classified).__name__, msg_text)
+                raise classified from exc
+            logger.warning("claude-sdk: subprocess exited / SDK error: %.200s", msg_text)
+            raise _SdkSubprocessError(msg_text) from exc
 
         if not saw_result:
+            logger.warning("claude-sdk: no terminal result (stream ended without ResultMessage)")
             raise _SdkNoResultError("stream ended without ResultMessage")
 
         prompt_tokens = usage_dict.get("input_tokens", 0)
@@ -412,7 +482,20 @@ class _SdkNoResultError(RuntimeError):
     """The SDK stream ended without a ``ResultMessage``.
 
     Defined here so :meth:`ClaudeSdkClient._run_sdk_turn` can raise it; Task 8
-    extends error handling (retry/interrupt/surfacing) around this signal.
+    lets it PROPAGATE so Hermes' outer loop ``api_max_retries`` retries the turn
+    rather than surfacing a truncated/empty answer as if it were complete.
+    """
+
+
+class _SdkSubprocessError(RuntimeError):
+    """The SDK ``claude`` subprocess died / errored / the turn timed out.
+
+    Like :class:`_SdkNoResultError`, this PROPAGATES to Hermes' outer loop so
+    ``api_max_retries`` handles it. Auth/quota-flavored subprocess failures are
+    NOT wrapped in this class — they are re-raised as the classified
+    :class:`~agent.claude_cli_client.ClaudeCliError` subclass (via
+    :func:`~agent.claude_cli_client._classify_cli_error`) so the retry path keeps
+    treating them identically to the claude-cli lane.
     """
 
 
@@ -597,6 +680,9 @@ from claude_agent_sdk import (  # noqa: E402
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    ClaudeSDKError,
+    PermissionResultAllow,
+    PermissionResultDeny,
     ResultMessage,
     TextBlock,
     ThinkingBlock,
@@ -604,9 +690,55 @@ from claude_agent_sdk import (  # noqa: E402
 )
 from claude_agent_sdk import tool as sdk_tool  # noqa: E402
 
+from agent.claude_cli_client import (  # noqa: E402  reuse the loop-understood classifier
+    ClaudeCliError,
+    _classify_cli_error,
+)
 from model_tools import handle_function_call  # noqa: E402  the single-fire hook entry
 
 HERMES_MCP_SERVER_NAME = "hermes"
+
+# Claude Code built-in tools the SDK CLI would otherwise expose. The SDK does
+# NOT export a canonical list, so this is the hand-maintained set we deny on the
+# claude-sdk lane (Approach B routes EVERY tool through Hermes' RBAC MCP proxy;
+# no native built-in may run). Kept in lock-step with ``can_use_tool`` below,
+# which is the defense-in-depth allow-list (only ``mcp__hermes__*`` passes).
+_DISALLOWED_BUILTINS = [
+    "Bash",
+    "Read",
+    "Write",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+    "Glob",
+    "Grep",
+    "WebFetch",
+    "WebSearch",
+    "Task",
+    "TodoWrite",
+    "BashOutput",
+    "KillShell",
+    "ExitPlanMode",
+    "SlashCommand",
+]
+
+
+async def _deny_non_hermes(tool_name: str, input: dict, context):  # noqa: A002
+    """``can_use_tool`` callback — defense-in-depth built-in-tool lockdown.
+
+    ALLOWS only tools named ``mcp__hermes__*`` (the RBAC-proxied Hermes tools);
+    DENIES every built-in Claude Code tool. This is a belt-and-suspenders guard
+    alongside ``disallowed_tools=_DISALLOWED_BUILTINS``; it does NOT carry the
+    RBAC block reason (Task 5's is_error tool RESULTS do that) — its deny message
+    is a lockdown notice only, and the model is not expected to read it.
+
+    ``behavior`` is left to the dataclass defaults (``'allow'`` / ``'deny'``).
+    """
+
+    if isinstance(tool_name, str) and tool_name.startswith("mcp__hermes__"):
+        return PermissionResultAllow()
+    return PermissionResultDeny(
+        message="claude-sdk: only Hermes tools are permitted", interrupt=False)
 
 
 def _capture_ctx() -> contextvars.Context:
@@ -646,6 +778,16 @@ def _make_proxy_handler(original_name, *, capture_ctx, turn_ids=None):
     turn_ids = turn_ids or {}
 
     async def _handler(args: dict) -> dict:
+        # (D) Interim tool visibility (v1: log-marker only). In Approach B the SDK
+        # runs tools internally, so Hermes' outer loop never sees these calls and
+        # the user gets NO tool-progress bubbles during a claude-sdk turn. The
+        # gateway's ``tool_progress_callback`` lives on the *agent* object, not in
+        # a contextvar, so it is NOT reachable from this bridge-thread handler
+        # without threading a cross-thread callback that could jeopardise RBAC/the
+        # turn. We therefore emit a greppable marker only and defer the real wiring.
+        # TODO(v1): wire gateway tool_progress_callback for interim bubbles.
+        logger.info("claude-sdk: tool %s invoked", original_name)
+
         def _dispatch():
             # Module-global lookup so monkeypatch.setattr can override it.
             return handle_function_call(

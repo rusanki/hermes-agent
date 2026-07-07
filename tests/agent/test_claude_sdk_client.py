@@ -65,3 +65,36 @@ def test_normalize_model_strips_prefix_and_defaults():
     assert _normalize_model("") == _DEFAULT_MODEL
     assert _normalize_model(None) == _DEFAULT_MODEL
     assert _normalize_model("claude-opus-4-8") == "claude-opus-4-8"
+
+
+# --- Task 8: error propagation, tool lockdown, can_use_tool deny ---
+
+
+def test_no_terminal_result_raises(monkeypatch):
+    from agent import claude_sdk_client as m
+    async def _no_result(self, *a, **k):
+        raise m._SdkNoResultError("stream ended without ResultMessage")
+    monkeypatch.setattr(m.ClaudeSdkClient, "_run_sdk_turn", _no_result, raising=False)
+    client = m.ClaudeSdkClient()
+    import pytest
+    with pytest.raises(Exception):  # must propagate, not return a clean answer
+        client.chat.completions.create(
+            model="x", messages=[{"role": "user", "content": "hi"}], tools=[])
+
+
+def test_disallowed_tools_covers_builtins():
+    from agent.claude_sdk_client import _DISALLOWED_BUILTINS
+    for name in ("Bash", "Read", "Write", "Edit", "WebFetch", "WebSearch", "Task"):
+        assert name in _DISALLOWED_BUILTINS
+
+
+def test_can_use_tool_denies_non_hermes():
+    import asyncio
+    from agent import claude_sdk_client as m
+    deny = m._deny_non_hermes  # module-level async deny callback
+    allow_res = asyncio.run(deny("mcp__hermes__terminal", {}, None))
+    deny_res = asyncio.run(deny("Bash", {}, None))
+    # Allow for hermes tools, deny for builtins. Assert via class name to avoid
+    # coupling to behavior field details.
+    assert type(allow_res).__name__ == "PermissionResultAllow"
+    assert type(deny_res).__name__ == "PermissionResultDeny"
