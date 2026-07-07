@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import threading
+from collections import OrderedDict
 from types import SimpleNamespace  # noqa: F401  (re-exported for test/consumer parity)
 from typing import Any
 
@@ -40,6 +41,26 @@ logger = logging.getLogger(__name__)
 
 CLAUDE_SDK_MARKER_BASE_URL = "claude-sdk://local"
 _DEFAULT_MODEL = "claude-haiku-4-5"  # matches claude-cli default; override via config
+
+
+def _normalize_model(m: str | None) -> str:
+    """Strip a provider prefix from a model id, defaulting when empty.
+
+    Mirrors :func:`agent.claude_cli_client._normalize_model` (accepting the
+    ``claude-sdk/`` prefix this lane may carry, plus ``anthropic/``). ``None``/
+    empty falls back to :data:`_DEFAULT_MODEL`. IMPORTANT: this default is a
+    LAST-RESORT only — the real model must arrive via the ``model`` kwarg so we
+    never silently downgrade a caller's opus/sonnet request to haiku.
+    """
+
+    if not m or not str(m).strip():
+        return _DEFAULT_MODEL
+    name = str(m).strip()
+    for prefix in ("claude-sdk/", "anthropic/"):
+        if name.startswith(prefix):
+            name = name[len(prefix):].strip()
+            break
+    return name or _DEFAULT_MODEL
 
 
 def _resolve_home_dir() -> str:
@@ -52,6 +73,32 @@ def _resolve_home_dir() -> str:
     from agent.claude_cli_client import _resolve_home_dir as _home
 
     return _home()
+
+
+def _safe_content(content: Any) -> str:
+    """Render OpenAI message content to a string, tolerating multimodal blocks.
+
+    Reuses claude-cli's renderer so a list/dict content (vision parts) joins its
+    text pieces instead of crashing a naive ``str``-join. Never raises.
+    """
+
+    try:
+        from agent.claude_cli_client import _render_message_content
+        return _render_message_content(content)
+    except Exception:  # pragma: no cover - defensive last resort
+        return "" if content is None else str(content)
+
+
+def _tool_names(tools: list | None) -> tuple[str, ...]:
+    """Stable ordered tuple of tool names for seed/turn comparison."""
+
+    names: list[str] = []
+    for t in tools or []:
+        fn = t.get("function", t) if isinstance(t, dict) else {}
+        name = fn.get("name") if isinstance(fn, dict) else None
+        if isinstance(name, str):
+            names.append(name)
+    return tuple(names)
 
 
 def _build_sdk_env() -> dict[str, str]:
@@ -166,7 +213,153 @@ class ClaudeSdkClient:
     def _create_chat_completion(self, **kwargs: Any) -> Any:
         if self._run_turn_stub is not None:
             return self._run_turn_stub(**kwargs)
-        raise NotImplementedError("claude-sdk turn not yet implemented")
+
+        # --- FRESH context snapshot per create() (Task 5 RBAC requirement). ---
+        ctx = _capture_ctx()
+        messages = kwargs.get("messages") or []
+        tools = kwargs.get("tools") or []
+        model = kwargs.get("model") or self._default_model
+        eff_model = _normalize_model(model)
+
+        # Extract the system text (applied via ClaudeAgentOptions, NOT as a turn)
+        # and the non-system conversation. Guard against multimodal (list/dict)
+        # content — _render_message_content joins the text parts, never crashes.
+        system_text = "\n\n".join(
+            _safe_content(m.get("content"))
+            for m in messages
+            if isinstance(m, dict) and m.get("role") == "system"
+        ).strip()
+
+        turn_ids = {
+            k: kwargs.get(k, "")
+            for k in ("task_id", "tool_call_id", "session_id", "turn_id", "api_request_id")
+        }
+
+        key = _session_key_for(kwargs)
+        session = _get_or_make_session(key)
+        decision = session.reconcile(messages)
+
+        if decision.reseed:
+            logger.info("claude-sdk: session reseed (%s)", decision.reseed_reason)
+            if session.sdk_client is not None:
+                _disconnect_client_on_bridge(session.sdk_client)
+            session.sdk_client = None
+            session.session_id = ""
+            session.shadow = []
+            new_prompt = _render_history_for_reseed(
+                _strip_system(messages), eff_model, tools)
+            sent_user_msgs = _strip_system(messages)
+        else:
+            new_prompt = "\n\n".join(
+                _safe_content(m.get("content"))
+                for m in decision.new_messages
+                if isinstance(m, dict)
+            ).strip()
+            sent_user_msgs = decision.new_messages
+
+        text, usage = _get_bridge().run(
+            self._run_sdk_turn(
+                session, new_prompt, eff_model, tools, ctx, turn_ids, system_text),
+            timeout=getattr(self, "_turn_timeout", None),
+        )
+
+        # Keep the shadow in lock-step with what the live SDK session now knows:
+        # the user message(s) we sent + the assistant final text (Task 6 strategy).
+        session.shadow.extend(sent_user_msgs)
+        session.shadow.append({"role": "assistant", "content": text})
+
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
+        cached_tokens = usage.get("cached_tokens", 0)
+        usage_ns = SimpleNamespace(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=cached_tokens),
+        )
+        assistant_message = SimpleNamespace(
+            content=text,
+            tool_calls=None,  # claude-sdk: SDK ran the full inner loop -> always None
+            reasoning=None,
+            reasoning_content=None,
+            reasoning_details=None,
+        )
+        # finish_reason is ALWAYS "stop": the SDK produced a single-shot final
+        # answer, so Hermes' outer loop does not iterate (Approach B).
+        choice = SimpleNamespace(message=assistant_message, finish_reason="stop")
+        return SimpleNamespace(choices=[choice], usage=usage_ns, model=eff_model)
+
+    async def _run_sdk_turn(
+        self, session, new_prompt, eff_model, tools, ctx, turn_ids, system_text,
+    ):
+        """Run one full agentic SDK turn on the bridge loop; return (text, usage).
+
+        Builds the persistent ``ClaudeSDKClient`` once per (re)seed with the
+        current tools wired through the Hermes RBAC MCP proxy, then queries and
+        drains ``receive_response()`` (which terminates after the ResultMessage).
+        Accumulates TextBlock output and the ResultMessage usage dict.
+        """
+
+        if session.sdk_client is None:
+            opts = ClaudeAgentOptions(
+                system_prompt=system_text or None,
+                mcp_servers={
+                    HERMES_MCP_SERVER_NAME: _build_mcp_server(
+                        tools, capture_ctx=ctx, turn_ids=turn_ids),
+                },
+                allowed_tools=["mcp__hermes__*"],
+                model=eff_model or None,
+                cli_path=self._cli_path,
+                env=_build_sdk_env(),
+                max_turns=getattr(self, "_max_turns", None),
+            )
+            client = ClaudeSDKClient(options=opts)
+            await client.connect()
+            session.sdk_client = client
+            session._seed_tool_names = _tool_names(tools)
+        else:
+            # Options (system_prompt/tools) are fixed at construction; a tool-set
+            # change mid-session is an edge case v1 ignores (log it if detected).
+            current = _tool_names(tools)
+            if current != getattr(session, "_seed_tool_names", current):
+                logger.warning(
+                    "claude-sdk: tool-set changed within a live session; "
+                    "reusing the seed tools (v1 limitation)")
+
+        await session.sdk_client.query(new_prompt)
+
+        final_text_parts: list[str] = []
+        usage_dict: dict = {}
+        saw_result = False
+        async for msg in session.sdk_client.receive_response():
+            if isinstance(msg, AssistantMessage):
+                for block in msg.content:
+                    if isinstance(block, TextBlock):
+                        final_text_parts.append(block.text)
+                    elif isinstance(block, ThinkingBlock):
+                        logger.debug("claude-sdk thinking: %.120s", block.thinking)
+                session.session_id = getattr(msg, "session_id", session.session_id)
+            elif isinstance(msg, ResultMessage):
+                usage_dict = msg.usage or {}
+                session.session_id = getattr(msg, "session_id", session.session_id)
+                saw_result = True
+                break  # receive_response() ends after ResultMessage anyway
+
+        if not saw_result:
+            raise _SdkNoResultError("stream ended without ResultMessage")
+
+        prompt_tokens = usage_dict.get("input_tokens", 0)
+        completion_tokens = usage_dict.get("output_tokens", 0)
+        cached_tokens = usage_dict.get("cache_read_input_tokens", 0)
+        return (
+            "".join(final_text_parts),
+            {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+                "cached_tokens": cached_tokens,
+            },
+        )
 
     def close(self) -> None:
         self.is_closed = True
@@ -213,6 +406,14 @@ def _get_bridge() -> _BridgeLoop:
         if _BRIDGE is None:
             _BRIDGE = _BridgeLoop()
         return _BRIDGE
+
+
+class _SdkNoResultError(RuntimeError):
+    """The SDK stream ended without a ``ResultMessage``.
+
+    Defined here so :meth:`ClaudeSdkClient._run_sdk_turn` can raise it; Task 8
+    extends error handling (retry/interrupt/surfacing) around this signal.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +511,74 @@ def _render_history_for_reseed(messages: list, model: str, tools: list) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Task 7: per-session store (LRU) of live SDK sessions.
+#
+# A Hermes ``create()`` maps to a session key; each key owns one persistent
+# ``_SdkSession`` (holding the live ``ClaudeSDKClient`` + shadow history). We
+# cap the number of live sessions and evict the oldest LRU-style, disconnecting
+# its subprocess best-effort. An evicted key that returns later simply rebuilds
+# a fresh session (empty shadow) and reconcile reseeds from rendered history —
+# correct-but-cold; we deliberately do NOT keep resume state for v1.
+# ---------------------------------------------------------------------------
+_SESSION_CAP = int(os.getenv("HERMES_CLAUDE_SDK_SESSION_CAP", "8") or "8")
+_SESSIONS: "OrderedDict[str, _SdkSession]" = OrderedDict()
+_SESSIONS_LOCK = threading.Lock()
+
+
+def _session_key_for(kwargs: dict) -> str:
+    """Derive a stable session key from create() kwargs.
+
+    Prefer an explicit ``session_key``; fall back to ``user`` (OpenAI's stable
+    per-user field, which Hermes populates with the verified user id), else a
+    single ``"default"`` bucket. reconcile() keeps history correct regardless of
+    how coarse the key is, so a single stable value is sufficient for v1.
+    """
+
+    return kwargs.get("session_key") or kwargs.get("user") or "default"
+
+
+def _disconnect_client_on_bridge(client: object) -> None:
+    """Best-effort ``client.disconnect()`` scheduled on the bridge loop.
+
+    Called from the LRU-eviction path (and monkeypatched by tests to spy). Never
+    raises: eviction must not fail because a dead/half-open subprocess won't
+    disconnect, and the bridge may not even be running yet.
+    """
+
+    if client is None:
+        return
+    try:
+        _get_bridge().run(client.disconnect(), timeout=5)
+    except Exception:  # pragma: no cover - best-effort cleanup
+        logger.debug("claude-sdk: disconnect on evict failed", exc_info=True)
+
+
+def _get_or_make_session(key: str) -> "_SdkSession":
+    """LRU get-or-create for the session keyed by ``key``.
+
+    Moves an existing key to the most-recent end. On insertion beyond
+    :data:`_SESSION_CAP`, evicts the oldest entry and disconnects its live SDK
+    client best-effort. The evicted ``_SdkSession`` (its session_id + shadow) is
+    discarded; a later request with that key rebuilds cold via reseed.
+    """
+
+    with _SESSIONS_LOCK:
+        existing = _SESSIONS.get(key)
+        if existing is not None:
+            _SESSIONS.move_to_end(key)
+            return existing
+        session = _SdkSession(session_id="")
+        _SESSIONS[key] = session
+        _SESSIONS.move_to_end(key)
+        while len(_SESSIONS) > _SESSION_CAP:
+            _evicted_key, evicted = _SESSIONS.popitem(last=False)
+            if getattr(evicted, "sdk_client", None) is not None:
+                _disconnect_client_on_bridge(evicted.sdk_client)
+                evicted.sdk_client = None
+        return session
+
+
+# ---------------------------------------------------------------------------
 # Task 5 — SECURITY-CRITICAL: in-process MCP tool proxy.
 #
 # Every native tool the model invokes on the SDK lane is routed through Hermes'
@@ -324,7 +593,15 @@ def _render_history_for_reseed(messages: list, model: str, tools: list) -> str:
 # proxy handler calls the bare module-global name, which is resolved through
 # this module's namespace at call time.
 # ---------------------------------------------------------------------------
-from claude_agent_sdk import create_sdk_mcp_server  # noqa: E402
+from claude_agent_sdk import (  # noqa: E402
+    AssistantMessage,
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
+    ResultMessage,
+    TextBlock,
+    ThinkingBlock,
+    create_sdk_mcp_server,
+)
 from claude_agent_sdk import tool as sdk_tool  # noqa: E402
 
 from model_tools import handle_function_call  # noqa: E402  the single-fire hook entry

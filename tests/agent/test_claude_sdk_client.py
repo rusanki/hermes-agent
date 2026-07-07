@@ -34,3 +34,34 @@ def test_env_scrub_removes_billing_vars(monkeypatch):
     env = _build_sdk_env()
     for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
         assert k not in env, f"{k} must be scrubbed to protect subscription billing"
+
+
+def test_turn_maps_final_text_and_usage(monkeypatch):
+    from agent import claude_sdk_client as m
+
+    async def _fake_run_turn(self, session, new_prompt, eff_model, tools, ctx, turn_ids, system_text):
+        return ("final answer",
+                {"prompt_tokens": 10, "completion_tokens": 5,
+                 "total_tokens": 15, "cached_tokens": 3})
+
+    monkeypatch.setattr(m.ClaudeSdkClient, "_run_sdk_turn", _fake_run_turn, raising=False)
+
+    client = m.ClaudeSdkClient()
+    resp = client.chat.completions.create(
+        model="claude-haiku-4-5",
+        messages=[{"role": "user", "content": "hi"}], tools=[])
+    assert resp.choices[0].message.content == "final answer"
+    assert resp.choices[0].message.tool_calls is None
+    assert resp.choices[0].finish_reason == "stop"
+    assert resp.usage.prompt_tokens == 10
+    assert resp.usage.completion_tokens == 5
+    assert resp.usage.prompt_tokens_details.cached_tokens == 3
+
+
+def test_normalize_model_strips_prefix_and_defaults():
+    from agent.claude_sdk_client import _normalize_model, _DEFAULT_MODEL
+    assert _normalize_model("claude-sdk/claude-opus-4-8") == "claude-opus-4-8"
+    assert _normalize_model("anthropic/claude-opus-4-8") == "claude-opus-4-8"
+    assert _normalize_model("") == _DEFAULT_MODEL
+    assert _normalize_model(None) == _DEFAULT_MODEL
+    assert _normalize_model("claude-opus-4-8") == "claude-opus-4-8"
