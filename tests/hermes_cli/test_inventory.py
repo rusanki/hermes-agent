@@ -462,6 +462,29 @@ def test_end_to_end_with_real_context_no_credentials_leak(monkeypatch):
     assert canary not in _json.dumps(payload)
 
 
+def test_claude_sdk_env_scrubs_billing_canary(monkeypatch):
+    """Billing invariant: the claude-sdk subprocess env must NEVER carry a
+    credential that could flip inference off the subscription-OAuth lane —
+    even when the parent process has one set. Colocated with the sk-canary
+    sweep so a future credential-leak audit also covers the claude-sdk
+    subprocess env (the scrub itself is exercised in the Task 3 unit test)."""
+    canary = "sk-canary-XYZ-must-not-appear"
+    scrubbed = (
+        "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+        "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "ANTHROPIC_MODEL",
+    )
+    for var in scrubbed:
+        monkeypatch.setenv(var, canary)
+    from agent.claude_sdk_client import _build_sdk_env
+
+    env = _build_sdk_env()
+    for var in scrubbed:
+        assert var not in env, f"{var} must be scrubbed from the claude-sdk subprocess env"
+    import json as _json
+
+    assert canary not in _json.dumps(env), "canary credential leaked into claude-sdk env"
+
+
 def test_payload_shape_compatible_with_modelpickerdialog_frontend():
     """Frontend (web/src/components/ModelPickerDialog.tsx) reads:
     name, slug, models, total_models, is_current, warning, authenticated.

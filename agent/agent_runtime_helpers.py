@@ -1397,6 +1397,17 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
             agent._client_log_context(),
         )
         return client
+    if agent.provider == "claude-sdk" or str(client_kwargs.get("base_url", "")).startswith("claude-sdk://"):
+        from agent.claude_sdk_client import ClaudeSdkClient
+
+        client = ClaudeSdkClient(**client_kwargs)
+        _ra().logger.info(
+            "Claude SDK client created (%s, shared=%s) %s",
+            reason,
+            shared,
+            agent._client_log_context(),
+        )
+        return client
     if agent.provider == "gemini":
         from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
 

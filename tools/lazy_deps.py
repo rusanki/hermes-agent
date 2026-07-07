@@ -97,6 +97,11 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # Native Anthropic SDK — needed when provider=anthropic (not via
     # OpenRouter / aggregators which use the openai SDK).
     "provider.anthropic": ("anthropic==0.87.0",),  # CVE-2026-34450, CVE-2026-34452
+    # Claude Agent SDK provider — needed when provider=claude-sdk. The SDK
+    # drives the `claude` CLI under the hood; the pip package is the Python
+    # binding. Exact-pinned to match the `claude-sdk` extra in pyproject.toml;
+    # bump both together.
+    "provider.claude_sdk": ("claude-agent-sdk==0.2.110",),
     # AWS Bedrock provider
     "provider.bedrock": ("boto3==1.42.89",),
     # Microsoft Foundry — Entra ID auth (managed identity, workload identity,
