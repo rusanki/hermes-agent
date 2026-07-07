@@ -24,6 +24,27 @@ Confirmed SDK API surface (Task 1, claude-agent-sdk==0.2.110):
   ``McpSdkServerConfig``.
 
 Sibling of ``agent/claude_cli_client.py``; that file is untouched (rollback lane).
+
+KNOWN v1 LIMITATIONS (documented after 3 rounds of adversarial review; these
+surface only outside the initial single-agent pod canary and are deferred):
+  * High-concurrency multi-user at/above the session cap: LRU eviction can null a
+    live session's client in the small unlocked window between
+    ``_get_or_make_session`` and acquiring ``session.lock`` (a concurrent turn for
+    that key then runs contextless rather than reseeding). The per-session lock
+    serialises same-key turns but does not extend to the eviction path.
+  * No native image/multimodal input path: image-only turns render to empty text
+    and are processed with a placeholder prompt (the SDK is not sent the bytes).
+    Vision aux stays on the claude-cli lane where a real ``claude`` binary exists.
+  * On an SDK-bundled-only host (no standalone ``claude`` on PATH), aux traffic
+    routes through a full ``ClaudeSdkClient`` turn — correct but costlier than the
+    one-shot ``claude -p`` the aux path prefers.
+  * A truly wedged bridge-loop turn cannot always be interrupted/reaped within the
+    teardown window (the teardown coroutine shares the monopolised loop).
+  * ``_normalize_content`` strips balanced reasoning-tag pairs only; an unbalanced
+    tag or tool-call XML in an assistant turn can still force a (correct but
+    costly) full reseed.
+These are tracked for v2 hardening; the single-agent canary does not exercise
+them (potter runs as one primary agent on a host with a real ``claude`` binary).
 """
 from __future__ import annotations
 
@@ -336,12 +357,21 @@ class ClaudeSdkClient:
                 if isinstance(m, dict)
             ).strip()
 
-        # Empty-query short-circuit: if the reconcile found no NEW user message
-        # (incoming == shadow, or a retry/regeneration with an assistant/tool-only
-        # tail), there is nothing to ask the SDK. Querying "" would waste a turn
-        # AND append a bogus assistant entry to the shadow that breaks the next
-        # real turn's prefix match. Return the last known assistant text instead.
-        if not new_prompt.strip():
+        # No-new-message short-circuit: fire ONLY when reconcile found no new
+        # message at all (incoming == shadow, or a retry/regeneration with an
+        # assistant/tool-only tail) — i.e. ``sent_user_msgs`` is empty. In that
+        # case there is genuinely nothing to ask; querying "" would waste a turn
+        # AND append a bogus assistant entry that breaks the next real turn's
+        # prefix match, so we return the last cached assistant text.
+        #
+        # CRITICAL: gate on ``sent_user_msgs`` being empty, NOT on ``new_prompt``
+        # being empty. A legitimate new turn can render to empty text (an
+        # image-only multimodal message, where _render_message_content keeps only
+        # text parts) — that is a REAL turn that must be processed, not
+        # short-circuited to stale text. When there IS a new message but it has no
+        # renderable text, fall through and run the turn with a minimal prompt so
+        # the SDK actually processes it.
+        if not sent_user_msgs:
             last_text = ""
             for m in reversed(session.shadow):
                 if isinstance(m, dict) and m.get("role") == "assistant":
@@ -349,6 +379,11 @@ class ClaudeSdkClient:
                     break
             logger.info("claude-sdk: no new user message; returning cached final text")
             return _build_response(last_text, {}, eff_model)
+        if not new_prompt.strip():
+            # New message(s) present but no renderable text (e.g. image-only).
+            # v1 claude-sdk has no native image path, so send a minimal prompt
+            # rather than an empty query, so the turn is still processed.
+            new_prompt = "(the user sent a message with no extractable text)"
 
         try:
             text, usage = _get_bridge().run(
@@ -360,16 +395,18 @@ class ClaudeSdkClient:
             # A bridge .run() timeout does NOT cancel the coroutine still executing
             # on the loop. Best-effort interrupt AND disconnect the wedged client
             # (interrupt() is only a stream control message — disconnect closes the
-            # transport / reaps the subprocess so it does not leak). Then REPLACE
-            # the whole session object: an in-place reset would keep this same
-            # object (and, in the old asyncio-lock design, a lock the wedged
-            # coroutine might still hold). A fresh object guarantees the next turn
-            # starts clean with no poisoned state.
+            # transport / reaps the subprocess so it does not leak). Then reset the
+            # session state IN PLACE (not swap the object): the per-session lock is
+            # a plain threading.Lock held by the ``with session.lock`` block in
+            # _create_chat_completion, so it is released the moment this exception
+            # unwinds that block — there is no poisoned-lock to escape by swapping,
+            # and swapping the stored object would orphan a concurrent same-key
+            # caller that already captured this session and is waiting on its lock.
             logger.warning(
-                "claude-sdk: turn timeout after %ss; interrupting + replacing session",
+                "claude-sdk: turn timeout after %ss; interrupting + resetting session",
                 getattr(self, "_turn_timeout", None))
             _teardown_wedged_client(getattr(session, "sdk_client", None))
-            _replace_session(key, session)
+            _reset_session_state(session)
             raise _SdkSubprocessError("turn timeout") from exc
         except Exception:
             # ANY turn failure leaves the session mid-conversation with no
@@ -795,22 +832,6 @@ def _teardown_wedged_client(client: object) -> None:
             _get_bridge().run(method(), timeout=5)
         except Exception:  # pragma: no cover - best-effort teardown
             logger.debug("claude-sdk: %s() on wedged client failed", op, exc_info=True)
-
-
-def _replace_session(key: str, old: "_SdkSession") -> None:
-    """Swap the session stored under ``key`` for a fresh one (timeout recovery).
-
-    A timed-out session may have a coroutine still wedged on the bridge loop; the
-    old object must NOT be reused (its shadow is stale and, historically, a lock
-    could be stuck held). Installing a brand-new ``_SdkSession`` guarantees the
-    next turn for this key starts clean. Caller holds ``old.lock``; the new object
-    has its own fresh lock, so releasing the old lock afterwards is harmless.
-    """
-    with _SESSIONS_LOCK:
-        # Only replace if the stored session is still the wedged one (a concurrent
-        # eviction may already have removed/replaced it).
-        if _SESSIONS.get(key) is old:
-            _SESSIONS[key] = _SdkSession(session_id="")
 
 
 def _reset_session_state(session: "_SdkSession") -> None:

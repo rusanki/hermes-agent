@@ -119,21 +119,43 @@ def test_session_has_distinct_sync_lock():
         assert not s2.lock.locked()  # locking one must not lock the other
 
 
-# ── G2: a timed-out session is REPLACED in the store (fresh lock, no poison) ─
-def test_replace_session_swaps_in_fresh_object():
+# ── G2: a timed-out session resets IN PLACE (lock released by the with-block) ─
+def test_timeout_resets_session_in_place(monkeypatch):
     from agent import claude_sdk_client as m
+
+    async def _timeout(self, *a, **k):
+        raise __import__("concurrent.futures").futures.TimeoutError()
+
+    # Drive the timeout through the real bridge-run wrapper by stubbing the turn
+    # to raise the same TimeoutError the bridge would.
+    def _boom_bridge_run(coro, timeout=None):
+        coro.close()
+        raise __import__("concurrent.futures").futures.TimeoutError()
+
+    monkeypatch.setattr(m, "_get_bridge", lambda: type("B", (), {
+        "run": staticmethod(_boom_bridge_run)})(), raising=False)
     m._SESSIONS.clear()
-    old = m._get_or_make_session("k1")
-    old.shadow = [{"role": "user", "content": "stale"}]
-    m._replace_session("k1", old)
-    new = m._SESSIONS["k1"]
-    assert new is not old
-    assert new.shadow == []
-    assert new.lock is not old.lock  # fresh lock -> no poisoned-lock reuse
+    client = m.ClaudeSdkClient()
+    key = client._instance_key
+    sess = m._get_or_make_session(key)
+    sess.shadow = [{"role": "user", "content": "u1"},
+                   {"role": "assistant", "content": "a1"}]
+    with pytest.raises(Exception):
+        client.chat.completions.create(
+            model="claude-opus-4-8",
+            messages=[{"role": "user", "content": "u1"},
+                      {"role": "assistant", "content": "a1"},
+                      {"role": "user", "content": "u2"}], tools=[])
+    # Same object still in the store (not swapped -> no orphan race), state reset.
+    assert m._SESSIONS[key] is sess
+    assert sess.shadow == []
+    assert sess.sdk_client is None
+    # Lock released by the `with session.lock` block unwinding on the exception.
+    assert not sess.lock.locked()
 
 
-# ── G6: no new user message short-circuits (no empty SDK query) ──────────────
-def test_empty_query_short_circuits_to_cached_text(monkeypatch):
+# ── G6/H1: short-circuit ONLY when there's no new message; image-only turns run ─
+def test_no_new_message_short_circuits_to_cached_text(monkeypatch):
     from agent import claude_sdk_client as m
 
     called = {"ran": False}
@@ -149,14 +171,44 @@ def test_empty_query_short_circuits_to_cached_text(monkeypatch):
     sess = m._get_or_make_session(key)
     sess.shadow = [{"role": "user", "content": "u1"},
                    {"role": "assistant", "content": "prior answer"}]
-    # Incoming == shadow (no new user turn): must NOT run a turn, must return the
-    # cached last assistant text.
+    # Incoming == shadow (NO new message): must NOT run a turn; return cached text.
     resp = client.chat.completions.create(
         model="claude-opus-4-8",
         messages=[{"role": "user", "content": "u1"},
                   {"role": "assistant", "content": "prior answer"}], tools=[])
     assert called["ran"] is False
     assert resp.choices[0].message.content == "prior answer"
+
+
+def test_image_only_new_turn_runs_not_short_circuited(monkeypatch):
+    """H1 regression guard: an image-only new message renders to empty TEXT but is
+    a REAL new turn — it must run, not return stale cached text."""
+    from agent import claude_sdk_client as m
+
+    ran = {"prompt": None}
+
+    async def _run(self, session, new_prompt, *a, **k):
+        ran["prompt"] = new_prompt
+        return ("image described", {"prompt_tokens": 1, "completion_tokens": 1,
+                                    "total_tokens": 2, "cached_tokens": 0})
+
+    monkeypatch.setattr(m.ClaudeSdkClient, "_run_sdk_turn", _run, raising=False)
+    m._SESSIONS.clear()
+    client = m.ClaudeSdkClient()
+    key = client._instance_key
+    sess = m._get_or_make_session(key)
+    sess.shadow = [{"role": "user", "content": "u1"},
+                   {"role": "assistant", "content": "prior answer"}]
+    # New user turn with ONLY an image part (empty renderable text).
+    resp = client.chat.completions.create(
+        model="claude-opus-4-8",
+        messages=[{"role": "user", "content": "u1"},
+                  {"role": "assistant", "content": "prior answer"},
+                  {"role": "user", "content": [
+                      {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}],
+        tools=[])
+    assert ran["prompt"] is not None, "image-only turn must actually run"
+    assert resp.choices[0].message.content == "image described"
 
 
 # ── G3: turn_ids must carry a non-empty task_id so tool sessions don't collide ─
