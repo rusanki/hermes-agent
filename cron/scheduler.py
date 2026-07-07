@@ -1561,6 +1561,21 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     if not path.is_file():
         return False, f"Script path is not a file: {path}"
 
+    # Approval gate (fail-closed): a cron may only run a script that a superadmin
+    # has approved (hash-pinned). is_approved re-hashes the on-disk file against
+    # the pin, so an edited/unapproved/unknown script is blocked here — the single
+    # choke point for all _run_job_script callers.
+    from cron.script_registry import is_approved as _script_is_approved
+    if not _script_is_approved(str(path)):
+        logger.warning(
+            "Cron script blocked (unapproved / hash mismatch / missing pin): %s", path
+        )
+        return False, (
+            "Blocked: script is not approved for cron execution. It must be staged "
+            "and approved by a superadmin (cron_script → cron_script_approve), and "
+            f"its content must match the approved sha256: {path}"
+        )
+
     script_timeout = _get_script_timeout()
 
     # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
