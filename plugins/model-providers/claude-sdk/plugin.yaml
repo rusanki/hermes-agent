@@ -1,0 +1,5 @@
+name: claude-sdk-profile
+kind: model-provider
+version: 1.0.0
+description: Drives the Claude Agent SDK (Python) in-process using Claude subscription OAuth
+author: upswing-one

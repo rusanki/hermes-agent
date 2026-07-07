@@ -191,6 +191,8 @@ _PROVIDER_ALIASES = {
     "copilot-acp-agent": "copilot-acp",
     "claude-code-cli": "claude-cli",
     "claude_subscription": "claude-cli",
+    "claude-agent-sdk": "claude-sdk",
+    "claude_sdk": "claude-sdk",
     "tencent": "tencent-tokenhub",
     "tokenhub": "tencent-tokenhub",
     "tencent-cloud": "tencent-tokenhub",
@@ -3501,7 +3503,18 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
         # ``.chat.completions.create`` themselves.
         from agent.copilot_acp_client import CopilotACPClient
         from agent.claude_cli_client import ClaudeCliClient
-        if isinstance(sync_client, (CopilotACPClient, ClaudeCliClient)):
+        subprocess_client_types: tuple = (CopilotACPClient, ClaudeCliClient)
+        # ClaudeSdkClient's module imports the OPTIONAL ``claude_agent_sdk``
+        # package. Guard it SEPARATELY so that on a deploy without the claude-sdk
+        # extra installed, the ImportError does not abort this whole block and
+        # skip the copilot/claude-cli short-circuit above (which would re-wrap a
+        # subprocess client as HTTP and break every async aux call).
+        try:
+            from agent.claude_sdk_client import ClaudeSdkClient
+            subprocess_client_types = subprocess_client_types + (ClaudeSdkClient,)
+        except ImportError:
+            pass
+        if isinstance(sync_client, subprocess_client_types):
             return sync_client, model
     except ImportError:
         pass
@@ -4153,22 +4166,57 @@ def resolve_provider_client(
             logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
             return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                     else (client, final_model))
-        if provider == "claude-cli":
+        if provider in ("claude-cli", "claude-sdk"):
             # Route ALL Anthropic auxiliary traffic (context compression,
-            # session-title generation, vision side-tasks) through the
-            # ``claude -p`` SUBPROCESS — never the direct-HTTP Anthropic OAuth
-            # path (build_anthropic_client), which would silently bill against
-            # "extra usage".  Default to a CHEAP aux model so side-tasks stay
-            # inexpensive and so we never trip the empty-model (None,None) guard
-            # for lack of a configured model.
+            # session-title generation, vision side-tasks) through the CHEAP
+            # ``claude -p`` SUBPROCESS (``ClaudeCliClient``) — never the
+            # direct-HTTP Anthropic OAuth path (build_anthropic_client), which
+            # would silently bill against "extra usage".  For a claude-sdk
+            # PRIMARY the aux client must ALSO be a cheap ClaudeCliClient, NOT a
+            # second ClaudeSdkClient (which runs the full SDK inner tool loop —
+            # far too expensive for a title/compression side-task).  Default to
+            # a CHEAP aux model so side-tasks stay inexpensive and so we never
+            # trip the empty-model (None,None) guard for lack of a configured
+            # model.
             if not final_model:
-                final_model = _normalize_resolved_model(
-                    _get_aux_model_for_provider("claude-cli"), provider
-                )
+                # Prefer this provider's own aux model; fall back to claude-cli's
+                # cheap aux model so claude-sdk always resolves a non-empty model.
+                aux_model = _get_aux_model_for_provider(provider) or _get_aux_model_for_provider("claude-cli")
+                final_model = _normalize_resolved_model(aux_model, provider)
             command = str(creds.get("command", "")).strip() or None
             args = list(creds.get("args") or [])
             api_key = str(creds.get("api_key", "")).strip() or None
             base_url = str(creds.get("base_url", "")).strip() or None
+            if provider == "claude-sdk" and not command:
+                # The claude-sdk primary bundles its own CLI, so its resolved
+                # ``command`` may be empty. Aux traffic (compression / title /
+                # vision) prefers the CHEAP claude-cli subprocess, which needs a
+                # real ``claude`` binary. Try to borrow claude-cli's resolved
+                # command; if there is no standalone binary (the SDK-bundled-only
+                # deploy), do NOT hand ClaudeCliClient a command it can't launch
+                # (that would spawn a doomed ``claude -p``). Instead route aux
+                # through a ClaudeSdkClient, which uses the SAME bundled CLI the
+                # primary uses and is guaranteed runnable here.
+                from hermes_cli.auth import (
+                    AuthError,
+                    resolve_external_process_provider_credentials,
+                )
+                try:
+                    cli_creds = resolve_external_process_provider_credentials("claude-cli")
+                    command = str(cli_creds.get("command", "")).strip() or None
+                    args = list(cli_creds.get("args") or [])
+                    base_url = str(cli_creds.get("base_url", "")).strip() or base_url
+                except AuthError:
+                    logger.debug(
+                        "aux: no standalone claude binary to borrow for claude-sdk; "
+                        "routing aux through the SDK-bundled CLI (ClaudeSdkClient)")
+                    from agent.claude_sdk_client import ClaudeSdkClient
+                    sdk_aux = ClaudeSdkClient(
+                        api_key=api_key, base_url=base_url, model=final_model)
+                    logger.debug("resolve_provider_client: %s aux via SDK (%s)",
+                                 provider, final_model)
+                    return (_to_async_client(sdk_aux, final_model, is_vision=is_vision)
+                            if async_mode else (sdk_aux, final_model))
             from agent.claude_cli_client import ClaudeCliClient
 
             client = ClaudeCliClient(

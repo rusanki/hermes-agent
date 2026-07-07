@@ -163,9 +163,9 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
     agent.request_overrides = overrides
 
 
-_EXTERNAL_PROCESS_PROVIDERS = ("copilot-acp", "claude-cli")
+_EXTERNAL_PROCESS_PROVIDERS = ("copilot-acp", "claude-cli", "claude-sdk")
 # URL prefixes that mark an external-process runtime (broader than the provider set)
-_EXTERNAL_PROCESS_URL_PREFIXES = ("acp://copilot", "acp+tcp://", "claude-cli://")
+_EXTERNAL_PROCESS_URL_PREFIXES = ("acp://copilot", "acp+tcp://", "claude-cli://", "claude-sdk://")
 
 
 def _is_external_process_runtime(provider, base_url) -> bool:

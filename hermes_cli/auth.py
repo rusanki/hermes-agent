@@ -92,6 +92,7 @@ DEFAULT_QWEN_BASE_URL = "https://portal.qwen.ai/v1"
 DEFAULT_GITHUB_MODELS_BASE_URL = "https://api.githubcopilot.com"
 DEFAULT_COPILOT_ACP_BASE_URL = "acp://copilot"
 DEFAULT_CLAUDE_CLI_BASE_URL = "claude-cli://local"
+DEFAULT_CLAUDE_SDK_BASE_URL = "claude-sdk://local"
 DEFAULT_OLLAMA_CLOUD_BASE_URL = "https://ollama.com/v1"
 STEPFUN_STEP_PLAN_INTL_BASE_URL = "https://api.stepfun.ai/step_plan/v1"
 STEPFUN_STEP_PLAN_CN_BASE_URL = "https://api.stepfun.com/step_plan/v1"
@@ -232,6 +233,13 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         auth_type="external_process",
         inference_base_url=DEFAULT_CLAUDE_CLI_BASE_URL,
         base_url_env_var="CLAUDE_CLI_BASE_URL",
+    ),
+    "claude-sdk": ProviderConfig(
+        id="claude-sdk",
+        name="Claude Agent SDK (subscription)",
+        auth_type="external_process",
+        inference_base_url=DEFAULT_CLAUDE_SDK_BASE_URL,
+        base_url_env_var="CLAUDE_SDK_BASE_URL",
     ),
     "gemini": ProviderConfig(
         id="gemini",
@@ -1527,6 +1535,7 @@ def resolve_provider(
         "github-models": "copilot", "github-model": "copilot",
         "github-copilot-acp": "copilot-acp", "copilot-acp-agent": "copilot-acp",
         "claude-code-cli": "claude-cli", "claude_subscription": "claude-cli",
+        "claude-agent-sdk": "claude-sdk", "claude_sdk": "claude-sdk",
         "opencode": "opencode-zen", "zen": "opencode-zen",
         "qwen-portal": "qwen-oauth", "qwen-cli": "qwen-oauth", "qwen-oauth": "qwen-oauth",
         "hf": "huggingface", "hugging-face": "huggingface", "huggingface-hub": "huggingface",
@@ -6100,6 +6109,15 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
         )
         raw_args = os.getenv("HERMES_CLAUDE_CLI_ARGS", "").strip()
         args = shlex.split(raw_args) if raw_args else []
+    elif provider_id == "claude-sdk":
+        # The Claude Agent SDK bundles its own CLI — an explicit binary path is
+        # OPTIONAL, so an empty command is fine (unlike claude-cli/copilot).
+        command = (
+            os.getenv("HERMES_CLAUDE_SDK_CLI_PATH", "").strip()
+            or os.getenv("CLAUDE_SDK_CLI_PATH", "").strip()
+        )
+        raw_args = os.getenv("HERMES_CLAUDE_SDK_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else []
     else:
         command = (
             os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
@@ -6116,7 +6134,11 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     # Copilot has an extra acp+tcp:// remote-bridge fallback; claude-cli's
     # availability is purely whether the local `claude` binary resolves.
     available = bool(resolved_command)
-    if provider_id != "claude-cli":
+    if provider_id == "claude-sdk":
+        # claude-sdk availability is structural: the SDK bundles its CLI, so the
+        # provider is usable even when no local `claude` binary resolves.
+        available = True
+    elif provider_id != "claude-cli":
         available = bool(resolved_command or base_url.startswith("acp+tcp://"))
     return {
         "configured": available,
@@ -6147,7 +6169,7 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_qwen_auth_status()
     if target == "minimax-oauth":
         return get_minimax_oauth_auth_status()
-    if target in ("copilot-acp", "claude-cli"):
+    if target in ("copilot-acp", "claude-cli", "claude-sdk"):
         return get_external_process_provider_status(target)
     if target == "azure-foundry":
         return _get_azure_foundry_auth_status()
@@ -6322,6 +6344,30 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
         return {
             "provider": provider_id,
             "api_key": "claude-cli",
+            "base_url": base_url.rstrip("/"),
+            "command": resolved_command,
+            "args": args,
+            "source": "process",
+        }
+
+    if provider_id == "claude-sdk":
+        # The Claude Agent SDK bundles its own CLI, so an explicit binary path is
+        # OPTIONAL — unlike claude-cli, an empty command is FINE (the SDK resolves
+        # its bundled CLI at runtime).  Never hard-fail on a missing binary.
+        command = (
+            os.getenv("HERMES_CLAUDE_SDK_CLI_PATH", "").strip()
+            or os.getenv("CLAUDE_SDK_CLI_PATH", "").strip()
+        )
+        raw_args = os.getenv("HERMES_CLAUDE_SDK_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else []
+        # If a path was provided, prefer the shutil.which-resolved binary but
+        # fall back to the raw value; never raise when it cannot be resolved.
+        resolved_command = ""
+        if command:
+            resolved_command = shutil.which(command) or command
+        return {
+            "provider": provider_id,
+            "api_key": "claude-sdk",
             "base_url": base_url.rstrip("/"),
             "command": resolved_command,
             "args": args,
