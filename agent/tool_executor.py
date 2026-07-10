@@ -511,6 +511,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
         if block_result is not None:
             results[i] = (name, args, block_result, 0.0, True, True, middleware_trace)
+            try:
+                from agent.request_trace import trace_tool_call
+                trace_tool_call(getattr(agent, "_request_trace_ctx", None),
+                                name=name, args=args, result=block_result,
+                                duration=0.0, is_error=True)
+            except Exception:
+                pass
 
     # Touch activity before launching workers so the gateway knows
     # we're executing tools (not stuck).
@@ -576,6 +583,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 duration = time.time() - start
                 logger.info("tool %s cancelled (%.2fs)", function_name, duration)
                 results[index] = (function_name, function_args, result, duration, True, False, middleware_trace)
+                try:
+                    from agent.request_trace import trace_tool_call
+                    trace_tool_call(getattr(agent, "_request_trace_ctx", None),
+                                    name=function_name, args=function_args, result=result,
+                                    duration=duration, is_error=True)
+                except Exception:
+                    pass
                 return
             except Exception as tool_error:
                 result = f"Error executing tool '{function_name}': {tool_error}"
