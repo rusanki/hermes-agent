@@ -238,6 +238,28 @@ def finalize_turn(
     else:
         logger.info(_diag_msg, *_diag_args)
 
+    # Request trace: flush the turn's accumulated record (inbound + all tool
+    # calls + this turn's response) as one JSON line, then reset the ctx so a
+    # stale ctx from this completed turn can never leak into a subsequent
+    # turn's tracing on the same agent object. This always runs regardless of
+    # which branch of the if/else above fired -- it's the single point every
+    # turn-exit path passes through.
+    try:
+        from agent.request_trace import trace_turn_end
+        trace_turn_end(
+            getattr(agent, "_request_trace_ctx", None),
+            response=final_response or "",
+            finish_reason=str(_turn_exit_reason or ""),
+            usage={},  # v1: no turn-total usage is cleanly available here (see note)
+        )
+    except Exception:
+        pass
+    finally:
+        try:
+            agent._request_trace_ctx = None
+        except Exception:
+            pass
+
     # File-mutation verifier footer.
     # If one or more ``write_file`` / ``patch`` calls failed during this
     # turn and were never superseded by a successful write to the same
