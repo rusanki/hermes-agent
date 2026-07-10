@@ -1,8 +1,10 @@
 """Per-turn request trace log (JSONL) for org-wide request debugging.
 
 One JSON record per turn: inbound message, every tool call (name + args +
-result), and the final response — all secret-redacted. Always-on (kill-switch
-env HERMES_REQUEST_TRACE=0). Failure-isolated: a trace failure NEVER breaks a
+result), and the final response — all secret-redacted (the "usage" field is
+the exception: it's structured telemetry, e.g. token counts, stored verbatim
+and not run through _redact()). Always-on (kill-switch env
+HERMES_REQUEST_TRACE=0). Failure-isolated: a trace failure NEVER breaks a
 turn. Covers the native tool path AND the claude-sdk MCP-proxy path (via a
 ContextVar visible on the SDK bridge thread).
 """
@@ -28,7 +30,7 @@ _WRITE_LOCK = threading.Lock()  # guards the append; cheap, whole-line writes.
 
 
 def _enabled() -> bool:
-    return (os.getenv("HERMES_REQUEST_TRACE", "1").strip() not in ("0", "false", "no", ""))
+    return (os.getenv("HERMES_REQUEST_TRACE", "1").strip().lower() not in ("0", "false", "no", ""))
 
 
 def _trace_path() -> str:

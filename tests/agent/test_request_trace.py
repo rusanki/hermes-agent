@@ -20,6 +20,19 @@ def test_disabled_returns_none(monkeypatch, tmp_path):
     rt.trace_turn_end(ctx, response="done", finish_reason="stop", usage={})
 
 
+def test_disabled_is_case_insensitive(monkeypatch, tmp_path):
+    # Kill-switch parsing must not be case-sensitive: "False"/"NO"/"FALSE" must
+    # all disable tracing just like the lowercase literals do.
+    monkeypatch.setenv("HERMES_REQUEST_TRACE", "False")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import importlib
+    from agent import request_trace as rt
+    importlib.reload(rt)
+    ctx = rt.trace_turn_start(session_id="s", user_id="u", platform="slack",
+                              model="m", provider="p", inbound="hi")
+    assert ctx is None
+
+
 def test_full_turn_writes_one_record_with_tools(monkeypatch, tmp_path):
     monkeypatch.delenv("HERMES_REQUEST_TRACE", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
