@@ -438,6 +438,84 @@ class TestErrorHandling:
         assert result["error"] == "user interrupted"
 
 
+class TestRequestTraceWiring:
+    """codex_app_server bypasses finalize_turn entirely, so run_codex_app_server_turn
+    must flush its own trace_turn_end at both exit points (normal completion and the
+    run_turn() exception path) and reset agent._request_trace_ctx afterward. See
+    tests/agent/test_request_trace.py::test_finalize_turn_flushes_and_resets_trace_ctx
+    for the sibling test on the chat_completions path.
+    """
+
+    def _trace_records(self):
+        import json
+        from pathlib import Path
+        from agent.request_trace import _trace_path
+        path = Path(_trace_path())
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+    def test_normal_completion_flushes_trace_and_resets_ctx(self, fake_session):
+        agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation("hello there")
+
+        recs = self._trace_records()
+        assert len(recs) == 1
+        assert recs[0]["response"] == "echo: hello there"
+        assert recs[0]["finish_reason"] == "stop"
+
+        # Ctx reset so a subsequent turn on the same agent object starts clean.
+        assert agent._request_trace_ctx is None
+
+    def test_interrupted_turn_flushes_trace_with_interrupted_reason(self, monkeypatch):
+        def interrupted_turn(self, user_input, **kwargs):
+            return TurnResult(
+                final_text="partial output",
+                projected_messages=[],
+                tool_iterations=0,
+                interrupted=True,
+                error=None,
+                turn_id="t",
+                thread_id="th",
+            )
+        monkeypatch.setattr(CodexAppServerSession, "ensure_started",
+                            lambda self: "th")
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", interrupted_turn)
+
+        agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation("hi")
+
+        recs = self._trace_records()
+        assert len(recs) == 1
+        assert recs[0]["response"] == "partial output"
+        assert recs[0]["finish_reason"] == "interrupted"
+        assert agent._request_trace_ctx is None
+
+    def test_session_exception_flushes_trace_with_error_reason(self, monkeypatch):
+        """The run_turn() exception path is a separate exit point from normal
+        completion — it must independently flush trace_turn_end(finish_reason="error")
+        and reset the ctx, or a crashed turn leaves both the trace log silent and a
+        stale ctx to leak into the next turn."""
+        def boom_run_turn(self, user_input, **kwargs):
+            raise RuntimeError("subprocess died")
+
+        monkeypatch.setattr(CodexAppServerSession, "ensure_started",
+                            lambda self: "t1")
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", boom_run_turn)
+
+        agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation("hi")
+
+        recs = self._trace_records()
+        assert len(recs) == 1
+        assert recs[0]["response"] == ""
+        assert recs[0]["finish_reason"] == "error"
+        assert agent._request_trace_ctx is None
+
+
 class TestSessionRetirementOnRunAgent:
     """run_agent.py side: when run_turn returns should_retire=True, the
     AIAgent must close + null _codex_session so the next turn respawns."""

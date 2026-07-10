@@ -118,6 +118,40 @@ def test_concurrent_preflight_interrupt_skips_all(monkeypatch):
     agent._invoke_tool.assert_not_called()
 
 
+def test_concurrent_preflight_interrupt_traces_each_cancelled_call(monkeypatch, tmp_path):
+    """The pre-flight interrupt branch cancels the whole queued batch and
+    returns before the per-call loop that already traces tool calls — so each
+    cancelled call must get its own trace_tool_call(is_error=True), mirroring
+    the idiom already used for the in-flight KeyboardInterrupt and
+    guardrail-blocked cases in the same function (see agent/tool_executor.py).
+    """
+    monkeypatch.delenv("HERMES_REQUEST_TRACE", raising=False)
+    import importlib
+    from agent import request_trace as rt
+    importlib.reload(rt)
+
+    agent = _make_agent(monkeypatch)
+    agent._interrupt_requested = True
+    agent._request_trace_ctx = rt.trace_turn_start(
+        session_id="s1", user_id="u1", platform="cli",
+        model="m", provider="p", inbound="do things",
+    )
+    assert agent._request_trace_ctx is not None
+
+    tc1 = _FakeToolCall("tool_a", call_id="tc_a")
+    tc2 = _FakeToolCall("tool_b", call_id="tc_b")
+    msg = _FakeAssistantMsg([tc1, tc2])
+    messages = []
+
+    agent._execute_tool_calls_concurrent(msg, messages, "test_task")
+
+    traced = agent._request_trace_ctx["tools"]
+    assert len(traced) == 2
+    assert {t["name"] for t in traced} == {"tool_a", "tool_b"}
+    assert all(t["is_error"] is True for t in traced)
+    assert all("skipped due to user interrupt" in t["result"] for t in traced)
+
+
 
 
 def test_clear_interrupt_clears_worker_tids(monkeypatch):
