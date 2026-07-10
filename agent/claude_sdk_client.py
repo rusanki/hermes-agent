@@ -1049,6 +1049,9 @@ def _make_proxy_handler(original_name, *, capture_ctx, turn_ids=None):
         # TODO(v1): wire gateway tool_progress_callback for interim bubbles.
         logger.info("claude-sdk: tool %s invoked", original_name)
 
+        import time as _time
+        _t0 = _time.monotonic()
+
         def _dispatch():
             # Module-global lookup so monkeypatch.setattr can override it.
             return handle_function_call(
@@ -1069,6 +1072,27 @@ def _make_proxy_handler(original_name, *, capture_ctx, turn_ids=None):
         # hook sees the verified user_id — the Context travels into the worker
         # thread with the callable.
         raw = await asyncio.to_thread(capture_ctx.run, _dispatch)
+
+        # Request trace (Task 5): record this tool call into the turn's trace
+        # ctx. The ctx is read from the _REQUEST_TRACE_CTX ContextVar (NOT from
+        # an `agent` object — this handler runs on the bridge thread, where
+        # there is no direct agent reference). This works because turn-start
+        # (agent/turn_context.py) sets the ContextVar BEFORE the provider's
+        # create() call, so `capture_ctx` — the contextvars.copy_context()
+        # snapshot taken at create() entry — includes it, and this coroutine's
+        # own top-level body runs within that ambient captured context.
+        # Failure-isolated: tracing must never break a tool call.
+        try:
+            from agent.request_trace import _REQUEST_TRACE_CTX, trace_tool_call
+            _text, _is_err = _extract_text_and_error(raw)
+            trace_tool_call(
+                _REQUEST_TRACE_CTX.get(),
+                name=original_name, args=args, result=raw,
+                duration=_time.monotonic() - _t0, is_error=_is_err,
+            )
+        except Exception:
+            logger.debug("claude-sdk: request trace tool_call failed", exc_info=True)
+
         return _to_mcp_result(raw)
 
     return _handler

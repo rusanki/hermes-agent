@@ -1,3 +1,4 @@
+import asyncio
 import json
 from pathlib import Path
 
@@ -140,3 +141,47 @@ def test_write_failure_does_not_raise(monkeypatch, tmp_path):
     ctx = rt.trace_turn_start(session_id="s", user_id="u", platform="p",
                               model="m", provider="p", inbound="hi")
     rt.trace_turn_end(ctx, response="ok", finish_reason="stop", usage={})  # must NOT raise
+
+
+def test_sdk_proxy_records_tool_under_captured_ctx(monkeypatch, tmp_path):
+    """The proxy handler runs on the bridge thread under a captured context; a
+    tool call there MUST record into the turn's trace ctx (the whole reason this
+    feature exists). We simulate by setting the ContextVar, capturing the
+    context, then running the handler under it — mirroring the RBAC user_id path
+    (see test_proxy_forwards_verified_user_id in test_claude_sdk_rbac.py).
+    """
+    monkeypatch.delenv("HERMES_REQUEST_TRACE", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import importlib
+    from agent import request_trace as rt
+    importlib.reload(rt)
+    from agent import claude_sdk_client as m
+
+    # Begin a turn -> sets the ContextVar (mirrors turn_context.py: trace_turn_start
+    # MUST run before the provider's _capture_ctx() snapshot).
+    ctx = rt.trace_turn_start(session_id="s", user_id="u", platform="slack",
+                              model="claude-sdk/x", provider="claude-sdk", inbound="q")
+
+    def fake_handle_function_call(name, args, **kw):
+        return '{"ok": true}'
+    monkeypatch.setattr(m, "handle_function_call", fake_handle_function_call, raising=False)
+
+    # Capture the context AFTER trace_turn_start, same as _create_chat_completion
+    # does in production (ctx = _capture_ctx() runs after turn_context.py's
+    # trace_turn_start call). We do NOT wrap the outer asyncio.run() call itself
+    # in captured.run(...): a contextvars.Context cannot be entered twice
+    # concurrently, and _handler's own internal `await
+    # asyncio.to_thread(capture_ctx.run, _dispatch)` already enters it once from
+    # the worker thread — wrapping the top-level call too raises "cannot enter
+    # context: ... is already entered" (confirmed empirically). Instead, mirror
+    # the RBAC test pattern: the ContextVar was set on THIS thread before
+    # _capture_ctx(), and asyncio.run() itself snapshots the calling thread's
+    # current context to run the coroutine, so a bare asyncio.run(handler(...))
+    # already sees the ContextVar at the handler's top level.
+    captured = m._capture_ctx()
+    handler = m._make_proxy_handler("cronjob", capture_ctx=captured, turn_ids={})
+    asyncio.run(handler({"action": "list"}))
+
+    # The proxy must have appended a tool event to THE SAME turn ctx.
+    assert any(t["name"] == "cronjob" for t in ctx["tools"]), \
+        "SDK-proxy tool call must be recorded into the turn trace ctx"
