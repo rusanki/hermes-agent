@@ -56,6 +56,7 @@ import logging
 import os
 import re
 import threading
+import time
 from collections import OrderedDict
 from types import SimpleNamespace  # noqa: F401  (re-exported for test/consumer parity)
 from typing import Any
@@ -1049,8 +1050,7 @@ def _make_proxy_handler(original_name, *, capture_ctx, turn_ids=None):
         # TODO(v1): wire gateway tool_progress_callback for interim bubbles.
         logger.info("claude-sdk: tool %s invoked", original_name)
 
-        import time as _time
-        _t0 = _time.monotonic()
+        _t0 = time.monotonic()
 
         def _dispatch():
             # Module-global lookup so monkeypatch.setattr can override it.
@@ -1084,11 +1084,11 @@ def _make_proxy_handler(original_name, *, capture_ctx, turn_ids=None):
         # Failure-isolated: tracing must never break a tool call.
         try:
             from agent.request_trace import _REQUEST_TRACE_CTX, trace_tool_call
-            _text, _is_err = _extract_text_and_error(raw)
+            _, _is_err = _extract_text_and_error(raw)
             trace_tool_call(
                 _REQUEST_TRACE_CTX.get(),
                 name=original_name, args=args, result=raw,
-                duration=_time.monotonic() - _t0, is_error=_is_err,
+                duration=time.monotonic() - _t0, is_error=_is_err,
             )
         except Exception:
             logger.debug("claude-sdk: request trace tool_call failed", exc_info=True)
