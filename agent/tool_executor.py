@@ -587,6 +587,15 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             else:
                 logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
             results[index] = (function_name, function_args, result, duration, is_error, False, middleware_trace)
+            # (this sits AFTER the full if is_error/else logging block, so BOTH
+            #  successful and errored tool calls are recorded — is_error captures which)
+            try:
+                from agent.request_trace import trace_tool_call
+                trace_tool_call(getattr(agent, "_request_trace_ctx", None),
+                                name=function_name, args=function_args, result=result,
+                                duration=duration, is_error=is_error)
+            except Exception:
+                pass
         finally:
             # Tear down worker-tid tracking.  Clear any interrupt bit we may
             # have set so the next task scheduled onto this recycled tid
@@ -1418,6 +1427,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
         else:
             logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, _result_len)
+
+        # (AFTER the full if/else logging block — records success AND error calls)
+        try:
+            from agent.request_trace import trace_tool_call
+            trace_tool_call(getattr(agent, "_request_trace_ctx", None),
+                            name=function_name, args=function_args,
+                            result=function_result, duration=tool_duration,
+                            is_error=_is_error_result)
+        except Exception:
+            pass
 
         # Track file-mutation outcome for the turn-end verifier.  See
         # the concurrent path for the rationale; both paths must feed
