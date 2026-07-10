@@ -299,6 +299,21 @@ def run_codex_app_server_turn(
         except Exception:
             pass
         agent._codex_session = None
+        try:
+            from agent.request_trace import trace_turn_end
+            trace_turn_end(
+                getattr(agent, "_request_trace_ctx", None),
+                response="",
+                finish_reason="error",
+                usage={},
+            )
+        except Exception:
+            pass
+        finally:
+            try:
+                agent._request_trace_ctx = None
+            except Exception:
+                pass
         return {
             "final_response": (
                 f"Codex app-server turn failed: {exc}. "
@@ -386,6 +401,29 @@ def run_codex_app_server_turn(
             )
         except Exception:
             logger.debug("background review spawn raised", exc_info=True)
+
+    if turn.interrupted:
+        _finish_reason = "interrupted"
+    elif turn.error is not None:
+        _finish_reason = "error"
+    else:
+        _finish_reason = "stop"
+
+    try:
+        from agent.request_trace import trace_turn_end
+        trace_turn_end(
+            getattr(agent, "_request_trace_ctx", None),
+            response=turn.final_text or "",
+            finish_reason=_finish_reason,
+            usage={},  # v1: consistent with turn_finalizer.py's scope-down
+        )
+    except Exception:
+        pass
+    finally:
+        try:
+            agent._request_trace_ctx = None
+        except Exception:
+            pass
 
     return {
         "final_response": turn.final_text,

@@ -305,11 +305,19 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     if agent._interrupt_requested:
         print(f"{agent.log_prefix}⚡ Interrupt: skipping {num_tools} tool call(s)")
         for tc in tool_calls:
+            _cancel_msg = f"[Tool execution cancelled — {tc.function.name} was skipped due to user interrupt]"
             messages.append(make_tool_result_message(
                 tc.function.name,
-                f"[Tool execution cancelled — {tc.function.name} was skipped due to user interrupt]",
+                _cancel_msg,
                 tc.id,
             ))
+            try:
+                from agent.request_trace import trace_tool_call
+                trace_tool_call(getattr(agent, "_request_trace_ctx", None),
+                                name=tc.function.name, args=tc.function.arguments, result=_cancel_msg,
+                                duration=0.0, is_error=True)
+            except Exception:
+                pass
             _flush_session_db_after_tool_progress(
                 agent,
                 messages,
