@@ -248,6 +248,24 @@ def build_turn_context(
         _msg_preview,
     )
 
+    # Request trace: begin the turn record. Set the ctx on the agent (native
+    # tool path reads it) AND in the ContextVar (the claude-sdk proxy on the
+    # bridge thread reads it). MUST run BEFORE any provider create() so the
+    # SDK's contextvars.copy_context() snapshot includes the ContextVar.
+    try:
+        from agent.request_trace import trace_turn_start
+        from gateway.session_context import get_session_user_id
+        agent._request_trace_ctx = trace_turn_start(
+            session_id=agent.session_id or "",
+            user_id=(get_session_user_id() or ""),
+            platform=agent.platform or "",
+            model=agent.model or "",
+            provider=agent.provider or "",
+            inbound=str(user_message),
+        )
+    except Exception:
+        agent._request_trace_ctx = None
+
     # Initialize conversation (copy to avoid mutating the caller's list).
     messages = list(conversation_history) if conversation_history else []
 
