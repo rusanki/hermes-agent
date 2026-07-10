@@ -95,6 +95,39 @@ def test_rotation_moves_to_dot1(monkeypatch, tmp_path):
     assert Path(rt._trace_path()).exists()
 
 
+def test_max_bytes_falls_back_on_non_finite_or_nonpositive(monkeypatch, tmp_path):
+    # nan/inf/-inf all parse via float() without a ValueError, and negative/zero
+    # values parse fine too -- _max_bytes() must still fall back to the 50MB
+    # default for all of them, and must never raise.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import importlib
+    from agent import request_trace as rt
+    importlib.reload(rt)
+    default_bytes = int(50 * 1024 * 1024)
+    for bad_value in ("nan", "inf", "-inf", "-1", "0", "-0.0"):
+        monkeypatch.setenv("HERMES_REQUEST_TRACE_MAX_MB", bad_value)
+        assert rt._max_bytes() == default_bytes, f"input {bad_value!r} must fall back to default"
+
+
+def test_max_bytes_never_raises_on_garbage_input(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import importlib
+    from agent import request_trace as rt
+    importlib.reload(rt)
+    for bad_value in ("nan", "inf", "-inf", "-1", "0", "not-a-number", "", "  "):
+        monkeypatch.setenv("HERMES_REQUEST_TRACE_MAX_MB", bad_value)
+        rt._max_bytes()  # must not raise
+
+
+def test_max_bytes_accepts_valid_positive_value(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_REQUEST_TRACE_MAX_MB", "10")
+    import importlib
+    from agent import request_trace as rt
+    importlib.reload(rt)
+    assert rt._max_bytes() == int(10 * 1024 * 1024)
+
+
 def test_write_failure_does_not_raise(monkeypatch, tmp_path):
     monkeypatch.delenv("HERMES_REQUEST_TRACE", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))

@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
+import math
 import os
 import threading
 from typing import Any
@@ -117,12 +118,29 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+_DEFAULT_MAX_MB = 50.0
+
+
 def _max_bytes() -> int:
+    """Max trace-file size before rotation, from HERMES_REQUEST_TRACE_MAX_MB.
+
+    Tolerates any garbage in the env var — non-numeric, nan/inf/-inf,
+    negative, or zero — by falling back to the 50MB default. Nothing in
+    this function may raise; callers rely on that.
+    """
     try:
-        mb = float(os.getenv("HERMES_REQUEST_TRACE_MAX_MB", "50") or "50")
-    except ValueError:
-        mb = 50.0
-    return int(mb * 1024 * 1024)
+        mb = float(os.getenv("HERMES_REQUEST_TRACE_MAX_MB", "") or _DEFAULT_MAX_MB)
+        if not (math.isfinite(mb) and mb > 0):
+            logger.debug(
+                "request_trace: HERMES_REQUEST_TRACE_MAX_MB=%r is not a finite "
+                "positive number; falling back to default %.0fMB",
+                os.getenv("HERMES_REQUEST_TRACE_MAX_MB"), _DEFAULT_MAX_MB,
+            )
+            mb = _DEFAULT_MAX_MB
+        return int(mb * 1024 * 1024)
+    except Exception:
+        logger.debug("request_trace: _max_bytes failed, using default", exc_info=True)
+        return int(_DEFAULT_MAX_MB * 1024 * 1024)
 
 
 def _rotate_if_needed(path: str) -> None:
