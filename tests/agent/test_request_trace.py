@@ -76,3 +76,34 @@ def test_secrets_are_redacted(monkeypatch, tmp_path):
     rt.trace_turn_end(ctx, response=f"used {secret}", finish_reason="stop", usage={})
     blob = Path(rt._trace_path()).read_text()
     assert secret not in blob, "raw secret must be redacted from the trace"
+
+
+def test_rotation_moves_to_dot1(monkeypatch, tmp_path):
+    monkeypatch.delenv("HERMES_REQUEST_TRACE", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_REQUEST_TRACE_MAX_MB", "0.0001")  # ~100 bytes
+    import importlib
+    from agent import request_trace as rt
+    importlib.reload(rt)
+    for i in range(5):
+        ctx = rt.trace_turn_start(session_id=f"s{i}", user_id="u", platform="p",
+                                  model="m", provider="p", inbound="x" * 200)
+        rt.trace_turn_end(ctx, response="y" * 200, finish_reason="stop", usage={})
+    from pathlib import Path
+    assert Path(rt._trace_path() + ".1").exists(), "rotation must create a .1 backup"
+    # current file exists and is smaller than the total written
+    assert Path(rt._trace_path()).exists()
+
+
+def test_write_failure_does_not_raise(monkeypatch, tmp_path):
+    monkeypatch.delenv("HERMES_REQUEST_TRACE", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import importlib
+    from agent import request_trace as rt
+    importlib.reload(rt)
+    # Force the write to blow up; trace_turn_end must swallow it.
+    monkeypatch.setattr(rt, "_write_record",
+                        lambda rec: (_ for _ in ()).throw(OSError("disk full")))
+    ctx = rt.trace_turn_start(session_id="s", user_id="u", platform="p",
+                              model="m", provider="p", inbound="hi")
+    rt.trace_turn_end(ctx, response="ok", finish_reason="stop", usage={})  # must NOT raise

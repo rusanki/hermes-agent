@@ -117,10 +117,27 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _max_bytes() -> int:
+    try:
+        mb = float(os.getenv("HERMES_REQUEST_TRACE_MAX_MB", "50") or "50")
+    except ValueError:
+        mb = 50.0
+    return int(mb * 1024 * 1024)
+
+
+def _rotate_if_needed(path: str) -> None:
+    try:
+        if os.path.exists(path) and os.stat(path).st_size >= _max_bytes():
+            os.replace(path, path + ".1")  # atomic; overwrites any prior .1
+    except Exception:
+        logger.debug("request_trace: rotation check failed", exc_info=True)
+
+
 def _write_record(record: dict) -> None:
     path = _trace_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
     with _WRITE_LOCK:
+        _rotate_if_needed(path)
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(line)
